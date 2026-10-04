@@ -617,10 +617,10 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
         }
 
         # ---- 4. 注册表优化（加载 SOFTWARE hive 注入）----
-        $softwareHive = Join-Path $mnt 'Windows\\System32\\config\\SOFTWARE'
+        $softwareHive = Join-Path $mnt 'Windows\System32\config\SOFTWARE'
         if (Test-Path -LiteralPath $softwareHive) {
-            $hiveLabel = 'HKLM\\WWINBLDG_SOFTWARE'          # reg.exe load 用
-            $hivePath = 'HKLM:\\WWINBLDG_SOFTWARE'          # PowerShell cmdlet 用
+            $hiveLabel = 'HKLM\WWINBLDG_SOFTWARE'          # reg.exe load 用
+            $hivePath = 'HKLM:\WWINBLDG_SOFTWARE'          # PowerShell cmdlet 用
             reg.exe load $hiveLabel $softwareHive 2>&1 | Out-Null
             if ($LASTEXITCODE -eq 0) {
                 # 遥测/诊断/隐私/性能（所有优化一次性写入）
