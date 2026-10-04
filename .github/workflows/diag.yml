@@ -1,0 +1,58 @@
+name: Diagnostics
+on:
+  workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: PowerShell environment probe
+    runs-on: windows-2025
+    steps:
+      - name: From pwsh (step shell) -> spawn cmd -> powershell 5.1
+        shell: pwsh
+        run: |
+          Write-Host "== pwsh 版本: $($PSVersionTable.PSVersion)"
+          Write-Host "== pwsh PSModulePath:"
+          ($env:PSModulePath -split ';') | ForEach-Object { Write-Host "   [$_]" }
+          $p = Get-Command powershell -ErrorAction SilentlyContinue
+          Write-Host "== 'powershell' 解析到: $($p.Source)"
+          Write-Host "== pwsh 里 Get-FileHash: $((Get-Command Get-FileHash -ErrorAction SilentlyContinue).Source)"
+
+          # 探针脚本：完全模拟 uup_download_windows.cmd 的调用方式
+          $probe = @'
+          Write-Host ("VER=" + $PSVersionTable.PSVersion)
+          Write-Host ("PSEDITION=" + $PSVersionTable.PSEdition)
+          Write-Host ("PSModulePath=" + $env:PSModulePath)
+          $c = Get-Command Get-FileHash -ErrorAction SilentlyContinue
+          Write-Host ("GetFileHash=" + $(if ($c) { 'FOUND ' + $c.Source } else { 'MISSING' }))
+          try { $h = (Get-FileHash -Path "$env:SystemRoot\notepad.exe" -Algorithm SHA256).Hash
+                Write-Host ("HASH_OK=" + $h.Substring(0,16)) }
+          catch { Write-Host ("HASH_ERR=" + $_.Exception.Message) }
+          '@
+          Set-Content -Path probe.ps1 -Value $probe
+          Write-Host "== 经 cmd.exe 调 powershell（和 UUP 脚本一样的方式）=="
+          cmd /c "powershell -NoProfile -ExecutionPolicy Unrestricted .\probe.ps1 < NUL"
+
+      - name: Direct Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          Write-Host "== (shell=powershell) 版本: $($PSVersionTable.PSVersion)"
+          Write-Host "== PSModulePath:"
+          ($env:PSModulePath -split ';') | ForEach-Object { Write-Host "   [$_]" }
+          $c = Get-Command Get-FileHash -ErrorAction SilentlyContinue
+          Write-Host "== Get-FileHash: $(if ($c) { 'FOUND ' + $c.Source } else { 'MISSING' })"
+
+      - name: Compare PSModulePath from both shells
+        shell: pwsh
+        run: |
+          $pwshPath = $env:PSModulePath
+          powershell -NoProfile -Command "`$env:PSModulePath" | Out-File -FilePath p51.txt -Encoding utf8
+          $p51 = (Get-Content p51.txt -Raw).Trim() -split ';'
+          $pw = $pwshPath -split ';'
+          Write-Host "== 5.1 有、pwsh 没有的："
+          $p51 | Where-Object { $_ -and ($pw -notcontains $_) } | ForEach-Object { Write-Host "   [+51] $_" }
+          Write-Host "== pwsh 有、5.1 没有的："
+          $pw  | Where-Object { $_ -and ($p51 -notcontains $_) } | ForEach-Object { Write-Host "   [+pwsh] $_" }
+          Write-Host "== 原始 pwsh PSModulePath = $pwshPath"
