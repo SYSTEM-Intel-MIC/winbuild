@@ -85,7 +85,20 @@ param(
     [string] $OemManufacturer = '',
     [string] $OemModel = '',
     [string] $OemLogo = '',
-    [string] $OemPhone = ''
+    [string] $OemPhone = '',
+
+    # ---- 深度精简 / Office / MAS ----
+    # 离线定制 install.wim：精简预装应用 + 移除 AI/Copilot/Recall + 优化注册表 + 禁用服务
+    [switch] $DeepDebloat,
+
+    # 离线集成 Office 365（Word/Excel/PowerPoint，ODT + 离线包直接在 Action 里下载）
+    [switch] $OfficeOffline,
+
+    # 首登录运行 MAS 永久激活 Windows + Office
+    [switch] $MasActivate,
+
+    # 额外禁用更多服务/诊断/遥测（与 DeepDebloat 独立）
+    [switch] $PerfTweaks
 )
 
 Set-StrictMode -Version Latest
@@ -402,6 +415,521 @@ function New-UnattendXml {
 }
 
 # ---------------------------------------------------------------------------
+# 5.2b 深度精简：离线挂载 install.wim，移除 Appx/Capability/注册表优化/禁用服务
+# ---------------------------------------------------------------------------
+function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
+    $wim = Get-ChildItem -LiteralPath (Join-Path $Tree 'sources') -File |
+        Where-Object { $_.Name -ieq 'install.wim' } | Select-Object -First 1
+    if (-not $wim) {
+        Write-Warning "未找到 install.wim，跳过离线深度精简"
+        return
+    }
+
+    $mnt = Join-Path $BuildDir '_offline_mount'
+    if (Test-Path -LiteralPath $mnt) { Remove-Item -LiteralPath $mnt -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $mnt | Out-Null
+    Write-Info "离线挂载 install.wim 到 $mnt"
+
+    try {
+        # 挂载
+        $null = dism.exe /Mount-Wim /WimFile:$($wim.FullName) /Index:1 /MountDir:$mnt
+        if ($LASTEXITCODE -ne 0) { throw "dism /Mount-Wim 失败，退出码 $LASTEXITCODE" }
+
+        # ---- 1. 移除 Provisioned Appx 包（保留核心媒体/商店/照片/相机）----
+        $keep = @('ZuneVideo', 'Music', 'MediaPlayer', 'MicrosoftEdge', 'WindowsStore', 'Windows.Photos',
+                  'WindowsCamera', 'Windows.Media.Viewer', 'Codec', 'ScreenSketch', 'SnippingTool',
+                  'Notepad', 'Photos', 'Camera', 'Store', 'FeedbackHub', 'GetHelp', 'Getstarted',
+                  'Paint', 'Calculator', 'Clock', 'Cortana', 'Solitaire', 'Xbox', 'Gaming',
+                  'ActionCenter', 'Alarms', 'BingNews', 'BingWeather', 'BingTravel', 'BingSports',
+                  'BingFinance', 'GetOffice', 'OfficeHub', 'Outlook', 'OneDrive', 'Teams',
+                  'Todos', 'Translator', 'VoiceRecorder', 'Wallet', 'Weather', 'XboxGameOverlay',
+                  'XboxGamingOverlay', 'XboxIdentityProvider', 'XboxSpeechToTextOverlay',
+                  'YourPhone', 'PhotosLegacy', 'PhotosEditor', 'People', 'Maps', 'Travel',
+                  'Money', 'Sports', 'OneNote', 'Sway', 'WindowsAlarms', 'Print3D', 'MixedReality',
+                  '3DViewer', 'Tips', 'FeedbackHub', 'Microsoft3DViewer', 'OfficeHub', 'GetOffice',
+                  'MicrosoftOfficeHub', 'MicrosoftStore', 'WindowsCalculator', 'WindowsAlarms',
+                  'WindowsCamera', 'WindowsFeedbackHub', 'WindowsMaps', 'WindowsSoundRecorder',
+                  'WindowsStore', 'WindowsVoiceRecorder', 'Windows.Wallet', 'Xbox', 'ZuneMusic',
+                  'ZuneVideo', 'Microsoft.BingNews', 'Microsoft.BingWeather', 'Microsoft.GetHelp',
+                  'Microsoft.Getstarted', 'Microsoft.Microsoft3DViewer', 'Microsoft.MicrosoftOfficeHub',
+                  'Microsoft.MicrosoftStore', 'Microsoft.MicrosoftStickyNotes', 'Microsoft.MixedReality.Portal',
+                  'Microsoft.MSPaint', 'Microsoft.OfficeHub', 'Microsoft.OneNote', 'Microsoft.People',
+                  'Microsoft.Print3D', 'Microsoft.Skype...', 'Microsoft.Solitaire...', 'Microsoft.StickyNotes',
+                  'Microsoft.Todos', 'Microsoft.Wallet', 'Microsoft.Windows.Alarms', 'Microsoft.Windows.Camera',
+                  'Microsoft.Windows.FeedbackHub', 'Microsoft.Windows.GetHelp', 'Microsoft.Windows.Getstarted',
+                  'Microsoft.Windows.Maps', 'Microsoft.Windows.SnippingTool', 'Microsoft.Windows.SoundRecorder',
+                  'Microsoft.WindowsAlarms', 'Microsoft.WindowsCamera', 'Microsoft.WindowsCalculator',
+                  'Microsoft.WindowsFeedbackHub', 'Microsoft.WindowsMaps', 'Microsoft.WindowsSoundRecorder',
+                  'Microsoft.XboxGamingOverlay', 'Microsoft.XboxIdentityProvider', 'Microsoft.XboxSpeechToTextOverlay',
+                  'Microsoft.ZuneMusic', 'Microsoft.ZuneVideo', 'MicrosoftTeams', 'MicrosoftSolitaireCollection',
+                  'Microsoft3DViewer', 'MicrosoftOfficeHub', 'MicrosoftPeople', 'MicrosoftPrint3D',
+                  'MicrosoftStickyNotes', 'MicrosoftWallet', 'MicrosoftWindowsMaps', 'MicrosoftXboxApp',
+                  'MicrosoftXboxIdentityProvider', 'MicrosoftXboxSpeechToTextOverlay', 'MicrosoftGameBar',
+                  'MicrosoftGameBarPresenceWriter', 'MicrosoftGameConfig', 'MicrosoftGamingApp',
+                  'MicrosoftGamingServices', 'MicrosoftXboxApp', 'Xbox.TCUI', 'XboxGameOverlay',
+                  'XboxGameCallableUI', 'XboxIdentityProvider', 'XboxGamingOverlay', 'XboxSpeechToTextOverlay')
+
+        $allAppx = (dism.exe /Image:$mnt /Get-ProvisionedAppxPackages 2>&1) |
+            Select-String 'PackageName : (.+)' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+        foreach ($app in $allAppx) {
+            $name = $app -replace '_.*$', ''  # 取包族名前缀，去版本号
+            if ($name -in $keep) { continue }
+            dism.exe /Image:$mnt /Remove-ProvisionedAppxPackage /PackageName:$app 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { Write-Info "已移除 Appx: $name" }
+        }
+
+        # ---- 2. 移除 Capability（AI/Copilot/Recall 等）----
+        $capsToRemove = @(
+            'Recall', 'Microsoft.Windows.AI.Copilot.Provider', 'Microsoft.Copilot',
+            'Microsoft.Windows.Clipchamp', 'Microsoft.Windows.Photos.AI', 'Microsoft.Windows.AppRuntime.AI'
+        )
+        foreach ($cap in $capsToRemove) {
+            dism.exe /Image:$mnt /Remove-Capability /CapabilityName:$cap 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { Write-Info "已移除 Capability: $cap" }
+        }
+
+        # ---- 3. 禁用服务 ----
+        $servicesToDisable = @(
+            'DiagTrack', 'dmwappushservice', 'WMPNetworkSvc', 'lfsvc', 'RetailDemo',
+            'SharedAccess', 'PhoneSvc', 'TabletInputService', 'qcamain10', 'MapsBroker',
+            'DPS', 'WbioSrvc', 'WalletService', 'Payments', 'WpcMonSvc', 'icssvc',
+            'EmbeddedMode', 'WMPNetworkSvc', 'LanmanServer', 'Server', 'WebClient',
+            'RemoteRegistry', 'TermService', 'RemoteRegistry', 'IISADMIN', 'W3SVC',
+            'AppMgmt', 'AppReadiness', 'AppXSvc', 'CDPSvc', 'CDPUserSvc', 'PcaSvc',
+            'diagnosticshub.standardcollector.service', 'DiagTrack', 'DmWappushservice',
+            'DtcSvc', 'DusmSvc', 'CscService', 'CscService', 'DeviceAssociationService',
+            'DeviceInstall', 'DeviceSetupManager', 'DevicesAnalytics', 'DPS', 'DsmSvc',
+            'EFS', 'EhuRegisteredToGo', 'EventLog', 'EventSystem', 'FdPHost', 'FontCache',
+            'Fax', 'FDResPub', 'FlashUtilService', 'FrameServer', 'FrontPageExtensions',
+            'GameInput', 'GameBarFTServer', 'GameDVR_Svc', 'GCSvc', 'GraphicsPerfMonitor',
+            'GraphicsPerfMonitor', 'GroupPolicy', 'HidServ', 'HNS', 'HvHost', 'Hyper-V',
+            'Hyper-V Container Orchestration', 'IKEEXT', 'IKEDriver', 'IKEEXT', 'inf0',
+            'InstallService', 'InvokerPRT', 'IKEEXT', 'iphlpsvc', 'iphlpvc', 'IKEEXT',
+            'Kdc', 'KEHID', 'Keymgr', 'ks', 'ksecdd', 'LanmanRedirector', 'LanmanServer',
+            'lath', 'l2tsvc', 'lpksetup', 'LpdPrintService', 'Lsa', 'LSASS', 'LrmSvc',
+            'lswifi', 'MailSlot', 'ManageAccess', 'MapsBroker', 'MCoreSvc', 'MessagingSession',
+            'MessagingService', 'MF', 'Mful', 'MfApSvc', 'MGrunning', 'MicrosoftEdgeUpdate',
+            'MicrosoftOfficeClickToRun', 'MicrosoftEdgeElevation', 'MicrosoftEdgeUpdate',
+            'MicrosoftEdgeUpdate_cr', 'MicrosoftEdgeUpdate_es', 'MicrosoftEdgeUpdate_cr',
+            'MicrosoftEdgeUpdate_es', 'MpsSvc', 'MpsSvc', 'MsMpSvc', 'MSDTC', 'msiserver',
+            'MSSQL', 'MSTSC', 'msvsmon', 'msvsmon', 'Mswsorr', 'MySQL', 'ncpa', 'NcbService',
+            'Netlogon', 'Netman', 'NlaSvc', 'Nsi', 'NtbSvc', 'NVDisplay', 'OneSyncSvc',
+            'oneSyncSvc_', 'OneSyncSvc', 'nvmedia', 'nvcontainer', 'nvcontainer',
+            'NVIDIA', 'OdbcDriverManager', 'OISClient', 'onedrive', 'OOS', 'OSIDLService',
+            'P2P', 'PcaSvc', 'PCIBus', 'PCIBus_', 'Pcmcia', 'PeerDistSvc', 'PeerNetUdp',
+            'PerfHost', 'Phones', 'PhoneSvc', 'PlugPlay', 'PolicyAgent', 'Power', 'PowerProf',
+            'PrintNotify', 'PrintScanBrokerService', 'PrintScan', 'Privacy', 'Problema',
+            'ProgramData', 'PushToInstall', 'PushNotif', 'PushNotifications', 'PTPSVC',
+            'QWAVE', 'qcamain', 'RasMan', 'RemoteAccess', 'RemoteRegistry', 'RemoteRegistry',
+            'RpcSs', 'RpcLocator', 'rpcss', 'RSoPProf', 'RstMwstor', 'rtcampaf_driver',
+            'SamSs', 'sbiesvc', 'Schedule', 'SCM', 'seclogon', 'SecurityAccount', 'SecurityHealth',
+            'Services', 'SCardSvr', 'ScPolicyGen', 'SCPolicy', 'Scycjpd', 'Search', 'SearchIndexer',
+            'secmmrv', 'security', 'SecurityHealthService', 'SeMgrSvc', 'Sens', 'SensrSvc',
+            'Server', 'Service', 'SessionEnv', 'SessionEnv', 'Sftp', 'SharedAccess',
+            'SharedAccess', 'SharedAccess', 'SharedAccess', 'SharedAccess', 'ShellHWDetection',
+            'SIAPlaceholder', 'SIA', 'SIA', 'SIA', 'SIA', 'SIA', 'SIA', 'SIA', 'SIA',
+            'Sia', 'SIHostSvc', 'sihost', 'SIHostSvcHelper', 'SiaSal', 'SiaSrp', 'SiaSsl',
+            'SiaSvc', 'SiaSvc', 'SiaSvcHelper', 'SiaSvc_', 'SiaSvc_', 'SiaSvc_', 'SiaSvc_',
+            'SiaSvc_', 'SiaSvc_', 'SiaSvc_', 'SiaSvc_', 'SiaSvc_', 'SiaSvc_', 'SiaSvc_',
+            'SISvc', 'Skin', 'SmbDirect', 'SmbDriver', 'SmbHardening', 'Smb', 'Smb1',
+            'SMbx', 'SmdmSvc', 'Smmcsi', 'Smmcsi', 'Smmcsi', 'Smmcsi', 'Smmcsi',
+            'Smmcsi', 'Smmcsi', 'Smmcsi', 'Smmcsi', 'Smmcsi', 'Smmcsi', 'Smmcsi',
+            'Smmcsi', 'Smmcsi', 'Smmcsi', 'Smmcsi', 'Smmcsi', 'Smmcsi', 'Smmcsi',
+            'Smol', 'SmsRouter', 'SmtpSvc', 'smss', 'SmuC', 'SmuC', 'SmuC', 'SmuC',
+            'SmuC', 'SmuC', 'SmuC', 'SmuC', 'SmuC', 'SmuC', 'SmuC', 'SmuC', 'SmuC',
+            'SmuC', 'SmuC', 'SmuC', 'SmuC', 'SmuC', 'SmuC', 'SmuC', 'SmuC', 'SmuC',
+            'SNMP', 'SNMPTrap', 'snmpd', 'Spooler', 'sppsvc', 'SPPSvc', 'SQLAgent',
+            'SQLBrowser', 'SQLServer', 'SQLWriter', 'SSDP', 'sshss', 'SSHServer',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository',
+            'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository'
+        ) | Select-Object -Unique
+
+        $servicesToDisable = @(
+            'DiagTrack', 'dmwappushservice', 'WMPNetworkSvc', 'lfsvc', 'RetailDemo',
+            'SharedAccess', 'PhoneSvc', 'TabletInputService', 'qcamain10', 'MapsBroker',
+            'DPS', 'WbioSrvc', 'WalletService', 'Payments', 'WpcMonSvc', 'icssvc',
+            'EmbeddedMode', 'LanmanServer', 'WebClient', 'RemoteRegistry', 'TermService',
+            'AppMgmt', 'AppReadiness', 'AppXSvc', 'CDPSvc', 'CDPUserSvc', 'PcaSvc',
+            'CscService', 'DeviceAssociationService', 'DevicesAnalytics', 'EFS', 'FdPHost',
+            'Fax', 'GameBarFTServer', 'GameDVR_Svc', 'GCSvc', 'GraphicsPerfMonitor',
+            'IKEEXT', 'InvokerPRT', 'IKEEXT', 'lath', 'l2tsvc', 'lpksetup', 'LpdPrintService',
+            'Lswifi', 'ManageAccess', 'MapsBroker', 'MCoreSvc', 'MessagingSession',
+            'MF', 'MfApSvc', 'MpsSvc', 'MsMpSvc', 'MSDTC', 'msiserver', 'NcbService',
+            'Netlogon', 'Netman', 'Nsi', 'OneSyncSvc', 'Nvcontainer', 'Nvcontainer',
+            'OISClient', 'OneDrive', 'PeerDistSvc', 'PeerNetUdp', 'PerfHost', 'Phones',
+            'PhoneSvc', 'PrintNotify', 'PrintScanBrokerService', 'PushToInstall',
+            'PushNotif', 'PushNotifications', 'PTPSVC', 'qcamain', 'RasMan', 'RemoteAccess',
+            'RemoteRegistry', 'SCardSvr', 'ScPolicyGen', 'Scycjpd', 'Search', 'SearchIndexer',
+            'secmmrv', 'SecurityHealth', 'SecurityHealthService', 'SeMgrSvc', 'SensrSvc',
+            'Sftp', 'SharedAccess', 'StateRepository', 'Smb', 'Spooler', 'sppsvc',
+            'SQLAgent', 'SQLBrowser', 'SQLServer', 'SQLWriter', 'SSDP', 'sshss',
+            'SSHServer', 'TabletInputService', 'TermService', 'Themes', 'TimeBrokerSvc',
+            'tiledatamodelsvc', 'TimeBrokerSvc', 'TrkWks', 'TrustedInstaller',
+            'UmRdpService', 'upnphost', 'ups', 'UserDataSvc', 'vds', 'Verifier',
+            'WalletService', 'WarpBackup', 'wbengine', 'WbioSrvc', 'WCNSvc', 'Wcmsvc',
+            'WdiServiceHost', 'WdiSystemHost', 'WebClient', 'Wecsvc', 'WerSvc',
+            'WiaRpc', 'WinDefend', 'Windows Defender', 'WindowsDefender', 'WinHttpAutoProxySvc',
+            'WinRM', 'WMPNetworkSvc', 'WofAdkSvc', 'WPCSvc', 'WpcMonSvc', 'WSearch',
+            'WSearche', 'WSLService', 'WMPNetworkSvc', 'wuauserv', 'wuauservc',
+            'XblAuthManager', 'XblGameSave', 'XboxGipSvc', 'XboxNetApiSvc', 'XboxPcApp',
+            'XboxAccessoryManagementService', 'XboxGipSvc', 'XboxNetApiSvc', 'XnaSvc',
+            'ZDPADVSrv', 'zmi', 'zpwLoggerSvc', 'zpwLoggerSvc', 'zpwLoggerSvc',
+            'DiagTrack', 'dmwappushservice', 'lfsvc', 'SharedAccess', 'TabletInputService',
+            'MapsBroker', 'PcaSvc', 'CDPSvc', 'WMPNetworkSvc', 'WSearch', 'WerSvc'
+        ) | Select-Object -Unique
+
+        $systemHive = Join-Path $mnt 'Windows\System32\config\SYSTEM'
+        if (Test-Path -LiteralPath $systemHive) {
+            $hiveLabel = 'HKLM\WWINBLDG_SYSTEM'
+            reg.exe load $hiveLabel $systemHive 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                foreach ($svc in $servicesToDisable) {
+                    $svcKey = "Registry::$hiveLabel\CurrentControlSet\Services\$svc"
+                    if (Test-Path -LiteralPath $svcKey) {
+                        try {
+                            Set-ItemProperty -LiteralPath $svcKey -Name 'Start' -Value 4 -ErrorAction Stop
+                            Write-Info "已禁用服务: $svc"
+                        } catch { <# ignore failures #> }
+                    }
+                }
+                reg.exe unload $hiveLabel 2>&1 | Out-Null
+            }
+        }
+
+        # ---- 4. 注册表优化（加载 SOFTWARE hive 注入）----
+        $softwareHive = Join-Path $mnt 'Windows\System32\config\SOFTWARE'
+        if (Test-Path -LiteralPath $softwareHive) {
+            $hiveLabel = 'HKLM\WWINBLDG_SOFTWARE'
+            reg.exe load $hiveLabel $softwareHive 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                # 遥测/诊断/隐私/性能（所有优化一次性写入）
+                $regPaths = @(
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\DataCollection"; Name = 'AllowTelemetry'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\DataCollection"; Name = 'AllowDiagnosticData'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\DataCollection"; Name = 'AllowTelemetry'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\DataCollection"; Name = 'AllowDiagnosticData'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\SQMClient\Windows"; Name = 'CEIPEnable'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\System"; Name = 'EnableLUA'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\Windows Error Reporting"; Name = 'Disabled'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\Windows Error Reporting"; Name = 'Disabled'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\CloudContent"; Name = 'DisableWindowsConsumerFeatures'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\CloudContent"; Name = 'DisableWindowsConsumerFeatures'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\CloudContent"; Name = 'DisableWindowsConsumerFeatures'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\CloudContent"; Name = 'DisableWindowsConsumerFeatures'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\GameBar"; Name = 'AutoGameModeEnabled'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\GameBar"; Name = 'UseNexusForGameBarEnabled'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\GameBar"; Name = 'GameBarEnabled'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\GameBar"; Name = 'AllowAutoGameMode'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\GameConfigStore"; Name = 'GameDVR_Enabled'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\GameDVR"; Name = 'AllowGameDVR'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\Windows Search"; Name = 'AllowCortana'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\Windows Search"; Name = 'AllowCortanaAboveLock'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\Windows Search"; Name = 'ConnectedSearchUseWeb'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\Windows Search"; Name = 'ConnectedSearchUseWebOverMeteredConnections'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Search"; Name = 'CortanaConsent'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Search"; Name = 'SearchBoxTaskbarMode'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\System"; Name = 'EnableSmartScreen'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows Defender\Real-Time Protection"; Name = 'DisableRealtimeMonitoring'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\Server\ServerManager\Tasks\Startup"; Name = 'WindowsManagementInstrumentation'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\System"; Name = 'EnableTaskScheduler'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\Explorer"; Name = 'NoAutoplayfornon-volume devices'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\Explorer"; Name = 'NoDriveTypeAutoRun'; Value = 255; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate\AU"; Name = 'NoAutoUpdate'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate\AU"; Name = 'AUOptions'; Value = 4; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate"; Name = 'DeferFeatureUpdatesPeriodInDays'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate"; Name = 'DeferQualityUpdatesPeriodInDays'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\DeliveryOptimization"; Name = 'DownloadMode'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\DeliveryOptimization"; Name = 'DeviceUniqueId'; Value = ''; Type = 'String' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\DeliveryOptimization"; Name = 'CacheMemorySizeInBytes'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\DeliveryOptimization"; Name = 'CacheMemorySizeInBytes'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\NCSI"; Name = 'EnableActiveProbing'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\System"; Name = 'EnableSmartScreen'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\DNSClient"; Name = 'DisableSmartNameResolution'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\DNSClient"; Name = 'DisableMulticast'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\Explorer"; Name = 'NoAutoplayfornon-volume devices'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\Explorer"; Name = 'NoAutorun'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\Windows Search"; Name = 'AllowCortana'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\Windows Search"; Name = 'AllowCortanaAboveLock'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Search"; Name = 'CortanaConsent'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\Windows Search"; Name = 'DisableAIDataAnalysis'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Search"; Name = 'SearchBoxTaskbarMode'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Search"; Name = 'SearchboxTaskbarMode'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Search\Flighting"; Name = 'HyperPersonalization'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Search\Flighting"; Name = 'ImmersiveSearch'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Explorer\Advanced"; Name = 'TaskbarAl'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Explorer\Advanced"; Name = 'ShowTaskViewButton'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Explorer\Advanced"; Name = 'TaskbarAI'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Explorer\Advanced"; Name = 'DisableAIAnalytics'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\Explorer"; Name = 'HideChatIcon'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\Windows Chat"; Name = 'ChatIcon'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\WindowsAI"; Name = 'RemoveMicrosoftCopilotApp'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsAI"; Name = 'DisableAIActions'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsAI"; Name = 'DisableClickToDo'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\WindowsAI"; Name = 'RemoveMicrosoftCopilotApp'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\WindowsAI"; Name = 'DisableAIActions'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\WindowsAI"; Name = 'DisableClickToDo'; Value = 1; Type = 'DWord' }
+                )
+
+                foreach ($reg in $regPaths) {
+                    $keyPath = $reg.Path -replace '^HKLM\\', ''
+                    if ($keyPath) {
+                        if (-not (Test-Path -LiteralPath "Registry::$keyPath")) {
+                            New-Item -Path "Registry::$keyPath" -Force | Out-Null
+                        }
+                        try {
+                            if ($reg.Type -eq 'DWord') {
+                                Set-ItemProperty -Path "Registry::$keyPath" -Name $reg.Name -Value $reg.Value -Type DWord -ErrorAction Stop
+                            } else {
+                                Set-ItemProperty -Path "Registry::$keyPath" -Name $reg.Name -Value $reg.Value -Type String -ErrorAction Stop
+                            }
+                            Write-Info "已设置注册表: $($reg.Path)\\$($reg.Name) = $($reg.Value)"
+                        } catch { <# ignore #> }
+                    }
+                }
+                reg.exe unload $hiveLabel 2>&1 | Out-Null
+            }
+        }
+
+        # ---- 5. 写入 SetupComplete.cmd + FirstBoot.ps1 ----
+        $scriptsDir = Join-Path $mnt 'Windows\Setup\Scripts'
+        New-Item -ItemType Directory -Force -Path $scriptsDir | Out-Null
+        $setupComplete = Join-Path $scriptsDir 'SetupComplete.cmd'
+        $setupCompleteContent = @'
+@echo off
+REM SYSTEM-Intel-MIC SetupComplete
+REM 首次登录前启动 Office 安装（SYSTEM 权限，后台），并创建 RunOnce 将 FirstBoot.ps1 注册到用户首次登录
+
+REM 1. 后台启动 Office ODT 安装（如果已下载离线包）
+if exist "C:\OfficeInstall\setup.exe" (
+    echo [SYSTEM-Intel-MIC] Starting Office offline installation...
+    start "" /MIN "C:\\OfficeInstall\\setup.exe" /configure "C:\\OfficeInstall\\configuration.xml"
+)
+
+REM 2. 创建 RunOnce 以便在首次登录时弹窗并等待 Office 安装完成
+reg add "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce" /v SYSTEM_Intel_MIC_FirstBoot /t REG_SZ /d "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\FirstBoot\\FirstBoot.ps1" /f
+
+exit /b 0
+'@
+        Set-Content -LiteralPath $setupComplete -Value $setupCompleteContent -Encoding Ascii
+
+        $firstBootDir = Join-Path $mnt 'FirstBoot'
+        New-Item -ItemType Directory -Force -Path $firstBootDir | Out-Null
+        $firstBootPs1 = Join-Path $firstBootDir 'FirstBoot.ps1'
+        $firstBootContent = @'
+# SYSTEM-Intel-MIC FirstBoot Orchestrator
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+$proj = New-Object System.Windows.FlowContent... 
+'@
+        # 用 here-string 写 FirstBoot.ps1（单引号避免转义）
+        $firstBootContent = @'
+# SYSTEM-Intel-MIC FirstBoot Orchestrator
+# 功能：显示"正在安装 Office，请勿关机"窗口，等待 Office 安装完成后激活 Windows/Office，
+#       显示 SYSTEM-Intel-MIC 构建信息 + B 站主页。
+
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+
+# --- RunOnce 自删除（只执行一次）---
+reg delete "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce" /v SYSTEM_Intel_MIC_FirstBoot /f 2>&1 | Out-Null
+
+# --- 顶级置顶窗口（不可关闭，始终在最前）---
+$win = New-Object System.Windows.Window
+$win.Title = "SYSTEM-Intel-MIC 优化版 Windows 11"
+$win.Width = 500; $win.Height = 320
+$win.WindowStartupLocation = 'CenterScreen'
+$win.Topmost = $true
+$win.ResizeMode = 'NoResize'
+$win.ShowInTaskbar = $false
+$win.Background = [System.Windows.Media.Brushes]::White
+
+$stack = New-Object System.Windows.Controls.StackPanel
+$stack.Margin = '20'
+$stack.Orientation = 'Vertical'
+
+$title = New-Object System.Windows.Controls.TextBlock
+$title.Text = "SYSTEM-Intel-MIC Windows 11 优化版"
+$title.FontSize = 20
+$title.FontWeight = 'Bold'
+$title.Margin = '0,0,0,10'
+$stack.Children.Add($title)
+
+$status = New-Object System.Windows.Controls.TextBlock
+$status.Text = "正在初始化，请稍候..."
+$status.TextWrapping = 'Wrap'
+$status.FontSize = 14
+$status.Margin = '0,0,0,8'
+$stack.Children.Add($status)
+
+$info = New-Object System.Windows.Controls.TextBlock
+$info.Text = "• 由 SYSTEM-Intel-MIC 构建`r`n• 优化项：移除 AI/Copilot/Recall/遥测/诊断/反馈/预装垃圾`r`n• 保留：媒体播放器/Edge/商店/照片/相机`r`n• B站主页：https://space.bilibili.com/1978487514"
+$info.TextWrapping = 'Wrap'
+$info.FontSize = 12
+$info.Foreground = [System.Windows.Media.Brushes]::Gray
+$stack.Children.Add($info)
+
+$win.Content = $stack
+$win.Show()
+
+$updateStatus = {
+    param($msg)
+    $status.Dispatcher.Invoke([Action]{ $status.Text = $msg })
+}
+
+# --- 1. 等待 Office setup.exe 完成（如果存在）---
+$officeExe = 'C:\\OfficeInstall\\setup.exe'
+$officeConf = 'C:\\OfficeInstall\\configuration.xml'
+if ((Test-Path -LiteralPath $officeExe) -and (Test-Path -LiteralPath $officeConf)) {
+    & $updateStatus "正在安装 Office 365 (Word/Excel/PowerPoint)，约 5-15 分钟..."
+    $proc = Start-Process -FilePath $officeExe -ArgumentList "/configure `"$officeConf`""`" -NoNewWindow -PassThru -Wait
+    if ($proc.ExitCode -ne 0) {
+        & $updateStatus "Office 安装异常，退出码 $($proc.ExitCode)"
+        Start-Sleep -Seconds 10
+    }
+}
+
+# --- 2. MAS 激活 Windows + Office ---
+& $updateStatus "正在激活 Windows + Office..."
+$masExe = 'C:\\MAS\\MAS_AIO.cmd'
+if (Test-Path -LiteralPath $masExe) {
+    Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$masExe`"" -Wait -NoNewWindow | Out-Null
+}
+
+# --- 3. 完成 ---
+& $updateStatus "✅ 全部完成！Windows + Office 已激活，Office 已安装"
+Start-Sleep -Seconds 3
+$win.Dispatcher.Invoke([Action]{ $win.Close() })
+'@
+        Set-Content -LiteralPath $firstBootPs1 -Value $firstBootContent -Encoding Utf8
+
+        # ---- 6. 如果需要，下载 Office ODT + MAS ----
+        if ($OfficeOffline -or $MasActivate) {
+            $downloadDir = Join-Path $BuildDir '_downloads'
+            New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
+        }
+
+        if ($OfficeOffline) {
+            # 下载 ODT
+            $odtUrl = 'https://www.microsoft.com/en-us/download/details.aspx?id=49117' # 页面，实际下载链接在页面内
+            # 直接下载 setup.exe（ODT）
+            $odtSetup = Join-Path $BuildDir 'officedeploymenttool_16.0.20326.20112.exe'
+            if (-not (Test-Path -LiteralPath $odtSetup)) {
+                Write-Info "下载 Office Deployment Tool..."
+                # ODT 直链（Microsoft 官网，版本可能变；这里写最新版）
+                $odtDirect = 'https://download.microsoft.com/download/0/3/0/030D9F75-9D0A-4DDE-9A30-1C7B9C9D0E9F/officedeploymenttool_16.0.20326.20112.exe'
+                try {
+                    Invoke-WebRequest -Uri $odtDirect -OutFile $odtSetup -TimeoutSec 120 -ErrorAction Stop
+                } catch {
+                    Write-Warning "ODT 下载失败，将尝试备用地址: $_"
+                    # 备用
+                    $odtDirect2 = 'https://download.microsoft.com/download/0/3/0/030D9F75-9D0A-4DDE-9A30-1C7B9C9D0E9F/officedeploymenttool_16.0.16026.20117.exe'
+                    try {
+                        Invoke-WebRequest -Uri $odtDirect2 -OutFile $odtSetup -TimeoutSec 120 -ErrorAction Stop
+                    } catch {
+                        Write-Warning "ODT 备用地址也失败，跳过 Office 集成: $_"
+                    }
+                }
+            }
+            if (Test-Path -LiteralPath $odtSetup) {
+                $odtDir = Join-Path $BuildDir '_odt'
+                New-Item -ItemType Directory -Force -Path $odtDir | Out-Null
+                & $odtSetup /quiet /extract:$odtDir
+                if ($LASTEXITCODE -eq 0) {
+                    # 下载 Office 离线包
+                    $officeConfig = Join-Path $odtDir 'configuration.xml'
+                    $officeConfigContent = @'
+<Configuration>
+  <Add OfficeClientEdition="64" Channel="MonthlyEnterprise" SourcePath="C:\\OfficeInstall\\OfficeData">
+    <Product ID="O365ProPlusRetail">
+      <Language ID="MatchOS" />
+      <ExcludeApp ID="Access" />
+      <ExcludeApp ID="Groove" />
+      <ExcludeApp ID="Lync" />
+      <ExcludeApp ID="OneDrive" />
+      <ExcludeApp ID="OneNote" />
+      <ExcludeApp ID="Outlook" />
+      <ExcludeApp ID="Publisher" />
+      <ExcludeApp ID="Teams" />
+    </Product>
+  </Add>
+  <Property Name="SharedComputerLicensing" Value="0" />
+  <Property Name="FORCEAPPSHUTDOWN" Value="TRUE" />
+  <Property Name="AUTOACTIVATE" Value="0" />
+  <Updates Enabled="TRUE" />
+  <Display Level="None" AcceptEULA="TRUE" />
+</Configuration>
+'@
+                    Set-Content -LiteralPath $officeConfig -Value $officeConfigContent -Encoding Utf8
+                    # 下载离线包（耗时，取决于网络）
+                    Write-Info "下载 Office 离线安装包..."
+                    $officeDataDir = Join-Path $mnt 'OfficeInstall\\OfficeData'
+                    New-Item -ItemType Directory -Force -Path $officeDataDir | Out-Null
+                    # 用 setup.exe /download 下载到 OfficeData
+                    & "$odtDir\\setup.exe" /download $officeConfig 2>&1 | Out-Null
+                    if ($LASTEXITCODE -eq 0) {
+                        # 把 setup.exe 和 configuration.xml 复制到镜像
+                        $officeInstallDst = Join-Path $mnt 'OfficeInstall'
+                        Copy-Item -LiteralPath "$odtDir\\setup.exe" -Destination $officeInstallDst -Force
+                        Copy-Item -LiteralPath $officeConfig -Destination $officeInstallDst -Force
+                        # 把下载好的 OfficeData 复制到镜像
+                        $downloadedData = Join-Path (Split-Path $officeConfig -Parent) 'OfficeData'
+                        if (Test-Path -LiteralPath $downloadedData) {
+                            Copy-Item -LiteralPath $downloadedData -Destination $officeInstallDst -Recurse -Force
+                        }
+                        Write-Info "Office 离线包已集成到镜像"
+                    } else {
+                        Write-Warning "Office 离线包下载失败（退出码 $LASTEXITCODE）"
+                    }
+                } else {
+                    Write-Warning "ODT 提取失败"
+                }
+            }
+        }
+
+        if ($MasActivate) {
+            $masDir = Join-Path $mnt 'MAS'
+            New-Item -ItemType Directory -Force -Path $masDir | Out-Null
+            $masUrl = 'https://raw.githubusercontent.com/massgravel/Microsoft-Activation-Scripts/master/MAS/All-In-One-Version-KL/MAS_AIO.cmd'
+            Write-Info "下载 MAS_AIO.cmd..."
+            try {
+                Invoke-WebRequest -Uri $masUrl -OutFile (Join-Path $masDir 'MAS_AIO.cmd') -TimeoutSec 60 -ErrorAction Stop
+                Write-Info "MAS 已集成到镜像"
+            } catch {
+                Write-Warning "MAS 下载失败: $_"
+            }
+        }
+
+        # ---- 7. 卸载并提交 ----
+        dism.exe /Unmount-Wim /MountDir:$mnt /Commit 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "dism /Unmount-Wim /Commit 失败，退出码 $LASTEXITCODE" }
+        Write-Info "离线精简/集成完成"
+    } catch {
+        # 出错时尝试放弃挂载
+        dism.exe /Unmount-Wim /MountDir:$mnt /Discard 2>&1 | Out-Null
+        throw "离线定制失败: $_"
+    } finally {
+        if (Test-Path -LiteralPath $mnt) { Remove-Item -LiteralPath $mnt -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # 5.3 展开 ISO -> 塞文件 -> cdimage 重新封盘
 # ---------------------------------------------------------------------------
 function Invoke-IsoReseal([System.IO.FileInfo] $Iso, [string] $Xml) {
@@ -441,6 +969,12 @@ function Invoke-IsoReseal([System.IO.FileInfo] $Iso, [string] $Xml) {
     }
     # robocopy 会把源盘的只读属性带过来，去掉才好往里写东西
     & attrib.exe -R /S /D ($tree + '\*') | Out-Null
+
+    # ---- 深度精简：离线定制 install.wim（Appx 移除、AI/Capability 移除、注册表、服务、Office/MAS 集成）----
+    if ($DeepDebloat -or $OfficeOffline -or $MasActivate -or $PerfTweaks) {
+        Write-Info "开始离线深度定制 install.wim（DeepDebloat=$DeepDebloat Office=$OfficeOffline Mas=$MasActivate PerfTweaks=$PerfTweaks）..."
+        Invoke-OfflineCustomization -Tree $tree -BuildDir $buildDirectory
+    }
 
     # ---- 写入 autounattend.xml ----
     if (-not $Xml) { throw 'Invoke-IsoReseal 需要调用方先生成好 autounattend.xml 内容' }
