@@ -88,10 +88,6 @@ on:
         default: ""
 
       # ---- OEM 信息（winver 授予者 / 获取帮助 / 注册表 OEMInformation）----
-      oem_owner:
-        description: "RegisteredOwner：winver「授予 XXX」"
-        type: string
-        default: ""
       oem_org:
         description: "RegisteredOrganization：winver「组织」"
         type: string
@@ -101,17 +97,13 @@ on:
         type: string
         default: "SYSTEM-Intel-MIC"
       oem_url:
-        description: "SupportURL：「获取帮助」跳转链接（没有协议头会自动补 https://）"
+        description: "SupportURL：「获取帮助」跳转链接；缺协议头会自动补 https://"
         type: string
         default: "https://space.bilibili.com/1978487514"
       oem_manufacturer:
         description: "Manufacturer（已弃用，写注册表 OEMInformation，Win11 设置→关于 不再显示）"
         type: string
         default: "SYSTEM-Intel-MIC"
-      oem_model:
-        description: "Model（已弃用）"
-        type: string
-        default: ""
       oem_logo:
         description: "Logo 路径；留空且仓库存在 OEM/logo.bmp 时自动用 C:\\Windows\\System32\\oemlogo.bmp 并把文件塞进 install.wim"
         type: string
@@ -199,7 +191,6 @@ jobs:
           IN_CHANNEL: ${{ inputs.channel }}
           IN_LOCAL_USER: ${{ inputs.local_user }}
           IN_LOCAL_PASSWORD: ${{ inputs.local_password }}
-          IN_OEM_OWNER: ${{ inputs.oem_owner }}
           IN_OEM_ORG: ${{ inputs.oem_org }}
           IN_OEM_PROVIDER: ${{ inputs.oem_provider }}
           IN_OEM_URL: ${{ inputs.oem_url }}
@@ -237,7 +228,6 @@ jobs:
           if ('${{ inputs.perf_tweaks }}' -eq 'true') { $p.PerfTweaks = $true }
           $p.LocalUser       = "$env:IN_LOCAL_USER"
           $p.LocalPassword   = "$env:IN_LOCAL_PASSWORD"
-          $p.OemOwner        = "$env:IN_OEM_OWNER"
           $p.OemOrg          = "$env:IN_OEM_ORG"
           $p.OemProvider     = "$env:IN_OEM_PROVIDER"
           $p.OemUrl          = "$env:IN_OEM_URL"
@@ -314,6 +304,10 @@ jobs:
               if ('${{ inputs.skip_oobe }}' -eq 'true') { $options += '跳过 OOBE' }
               if ($env:IN_OEM_ORG) { $options += "OEM 信息（组织=$env:IN_OEM_ORG）" }
           }
+          if ('${{ inputs.deep_debloat }}' -eq 'true') { $options += '深度精简（移除 Appx/AI/服务/注册表）' }
+          if ('${{ inputs.office_offline }}' -eq 'true') { $options += 'Office 365 离线集成（Word/Excel/PowerPoint）' }
+          if ('${{ inputs.mas_activate }}' -eq 'true') { $options += 'MAS 首登录自动激活' }
+          if ('${{ inputs.perf_tweaks }}' -eq 'true') { $options += '额外系统性能/隐私优化' }
           if (-not $options) { $options = '默认（无附加选项）' }
 
           $unattendNotes = ''
