@@ -599,11 +599,12 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
 
         $systemHive = Join-Path $mnt 'Windows\System32\config\SYSTEM'
         if (Test-Path -LiteralPath $systemHive) {
-            $hiveLabel = 'HKLM\WWINBLDG_SYSTEM'
+            $hiveLabel = 'HKLM\WWINBLDG_SYSTEM'          # reg.exe load 用
+            $hivePath = 'HKLM:\WWINBLDG_SYSTEM'          # PowerShell cmdlet 用
             reg.exe load $hiveLabel $systemHive 2>&1 | Out-Null
             if ($LASTEXITCODE -eq 0) {
                 foreach ($svc in $servicesToDisable) {
-                    $svcKey = "Registry::$hiveLabel\CurrentControlSet\Services\$svc"
+                    $svcKey = "$hivePath\CurrentControlSet\Services\$svc"
                     if (Test-Path -LiteralPath $svcKey) {
                         try {
                             Set-ItemProperty -LiteralPath $svcKey -Name 'Start' -Value 4 -ErrorAction Stop
@@ -616,9 +617,10 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
         }
 
         # ---- 4. 注册表优化（加载 SOFTWARE hive 注入）----
-        $softwareHive = Join-Path $mnt 'Windows\System32\config\SOFTWARE'
+        $softwareHive = Join-Path $mnt 'Windows\\System32\\config\\SOFTWARE'
         if (Test-Path -LiteralPath $softwareHive) {
-            $hiveLabel = 'HKLM\WWINBLDG_SOFTWARE'
+            $hiveLabel = 'HKLM\\WWINBLDG_SOFTWARE'          # reg.exe load 用
+            $hivePath = 'HKLM:\\WWINBLDG_SOFTWARE'          # PowerShell cmdlet 用
             reg.exe load $hiveLabel $softwareHive 2>&1 | Out-Null
             if ($LASTEXITCODE -eq 0) {
                 # 遥测/诊断/隐私/性能（所有优化一次性写入）
@@ -692,14 +694,15 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                 foreach ($reg in $regPaths) {
                     $keyPath = $reg.Path -replace '^HKLM\\', ''
                     if ($keyPath) {
-                        if (-not (Test-Path -LiteralPath "Registry::$keyPath")) {
-                            New-Item -Path "Registry::$keyPath" -Force | Out-Null
+                        $psPath = $reg.Path -replace '^HKLM\\', 'HKLM:\'
+                        if (-not (Test-Path -LiteralPath $psPath)) {
+                            New-Item -Path $psPath -Force | Out-Null
                         }
                         try {
                             if ($reg.Type -eq 'DWord') {
-                                Set-ItemProperty -Path "Registry::$keyPath" -Name $reg.Name -Value $reg.Value -Type DWord -ErrorAction Stop
+                                Set-ItemProperty -LiteralPath $psPath -Name $reg.Name -Value $reg.Value -Type DWord -ErrorAction Stop
                             } else {
-                                Set-ItemProperty -Path "Registry::$keyPath" -Name $reg.Name -Value $reg.Value -Type String -ErrorAction Stop
+                                Set-ItemProperty -LiteralPath $psPath -Name $reg.Name -Value $reg.Value -Type String -ErrorAction Stop
                             }
                             Write-Info "已设置注册表: $($reg.Path)\\$($reg.Name) = $($reg.Value)"
                         } catch { <# ignore #> }
@@ -721,11 +724,11 @@ REM 首次登录前启动 Office 安装（SYSTEM 权限，后台），并创建 
 REM 1. 后台启动 Office ODT 安装（如果已下载离线包）
 if exist "C:\OfficeInstall\setup.exe" (
     echo [SYSTEM-Intel-MIC] Starting Office offline installation...
-    start "" /MIN "C:\\OfficeInstall\\setup.exe" /configure "C:\\OfficeInstall\\configuration.xml"
+    start "" /MIN "C:\OfficeInstall\setup.exe" /configure "C:\OfficeInstall\configuration.xml"
 )
 
 REM 2. 创建 RunOnce 以便在首次登录时弹窗并等待 Office 安装完成
-reg add "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce" /v SYSTEM_Intel_MIC_FirstBoot /t REG_SZ /d "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\FirstBoot\\FirstBoot.ps1" /f
+reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" /v SYSTEM_Intel_MIC_FirstBoot /t REG_SZ /d "powershell -NoProfile -ExecutionPolicy Bypass -File C:\FirstBoot\FirstBoot.ps1" /f
 
 exit /b 0
 '@
@@ -736,19 +739,13 @@ exit /b 0
         $firstBootPs1 = Join-Path $firstBootDir 'FirstBoot.ps1'
         $firstBootContent = @'
 # SYSTEM-Intel-MIC FirstBoot Orchestrator
-Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
-$proj = New-Object System.Windows.FlowContent... 
-'@
-        # 用 here-string 写 FirstBoot.ps1（单引号避免转义）
-        $firstBootContent = @'
-# SYSTEM-Intel-MIC FirstBoot Orchestrator
 # 功能：显示"正在安装 Office，请勿关机"窗口，等待 Office 安装完成后激活 Windows/Office，
 #       显示 SYSTEM-Intel-MIC 构建信息 + B 站主页。
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
 # --- RunOnce 自删除（只执行一次）---
-reg delete "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce" /v SYSTEM_Intel_MIC_FirstBoot /f 2>&1 | Out-Null
+reg delete "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" /v SYSTEM_Intel_MIC_FirstBoot /f 2>&1 | Out-Null
 
 # --- 顶级置顶窗口（不可关闭，始终在最前）---
 $win = New-Object System.Windows.Window
@@ -794,8 +791,8 @@ $updateStatus = {
 }
 
 # --- 1. 等待 Office setup.exe 完成（如果存在）---
-$officeExe = 'C:\\OfficeInstall\\setup.exe'
-$officeConf = 'C:\\OfficeInstall\\configuration.xml'
+$officeExe = 'C:\OfficeInstall\setup.exe'
+$officeConf = 'C:\OfficeInstall\configuration.xml'
 if ((Test-Path -LiteralPath $officeExe) -and (Test-Path -LiteralPath $officeConf)) {
     & $updateStatus "正在安装 Office 365 (Word/Excel/PowerPoint)，约 5-15 分钟..."
     $proc = Start-Process -FilePath $officeExe -ArgumentList "/configure `"$officeConf`""`" -NoNewWindow -PassThru -Wait
@@ -807,7 +804,7 @@ if ((Test-Path -LiteralPath $officeExe) -and (Test-Path -LiteralPath $officeConf
 
 # --- 2. MAS 激活 Windows + Office ---
 & $updateStatus "正在激活 Windows + Office..."
-$masExe = 'C:\\MAS\\MAS_AIO.cmd'
+$masExe = 'C:\MAS\MAS_AIO.cmd'
 if (Test-Path -LiteralPath $masExe) {
     Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$masExe`"" -Wait -NoNewWindow | Out-Null
 }
@@ -856,7 +853,7 @@ $win.Dispatcher.Invoke([Action]{ $win.Close() })
                     $officeConfig = Join-Path $odtDir 'configuration.xml'
                     $officeConfigContent = @'
 <Configuration>
-  <Add OfficeClientEdition="64" Channel="MonthlyEnterprise" SourcePath="C:\\OfficeInstall\\OfficeData">
+  <Add OfficeClientEdition="64" Channel="MonthlyEnterprise" SourcePath="C:\OfficeInstall\OfficeData">
     <Product ID="O365ProPlusRetail">
       <Language ID="MatchOS" />
       <ExcludeApp ID="Access" />
