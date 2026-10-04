@@ -601,15 +601,19 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
         Write-Info "SYSTEM hive 路径: $systemHive"
         if (Test-Path -LiteralPath $systemHive) {
             $hiveLabel = 'HKLM\WWINBLDG_SYSTEM'
-            $hivePath = 'HKLM:\WWINBLDG_SYSTEM'
+            $hivePSDrive = 'WWINBLDG_SYSTEM'
             $null = reg.exe load $hiveLabel $systemHive 2>&1
             Write-Info "SYSTEM hive load 结果: $LASTEXITCODE"
             if ($LASTEXITCODE -ne 0) {
                 Write-Warning "SYSTEM hive load 失败，跳过服务优化"
             } else {
                 # 离线镜像没有 CurrentControlSet，改用 ControlSet001
+                $psDriveExists = Get-PSDrive $hivePSDrive -ErrorAction SilentlyContinue
+                if (-not $psDriveExists) {
+                    $null = New-PSDrive -Name $hivePSDrive -PSProvider Registry -Root "HKLM:\\$hivePSDrive" -ErrorAction SilentlyContinue
+                }
                 foreach ($svc in $servicesToDisable) {
-                    $svcKey = "$hivePath\ControlSet001\Services\$svc"
+                    $svcKey = "${hivePSDrive}:\\ControlSet001\\Services\\$svc"
                     if (Test-Path -LiteralPath $svcKey) {
                         try {
                             Set-ItemProperty -LiteralPath $svcKey -Name 'Start' -Value 4 -ErrorAction Stop
@@ -617,6 +621,7 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                         } catch { <# ignore #> }
                     }
                 }
+                $null = Remove-PSDrive -Name $hivePSDrive -ErrorAction SilentlyContinue
                 $null = reg.exe unload $hiveLabel 2>&1
                 Write-Info "SYSTEM hive unload 结果: $LASTEXITCODE"
             }
@@ -627,10 +632,14 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
         # ---- 4. 注册表优化（加载 SOFTWARE hive 注入）----
         $softwareHive = Join-Path $mnt 'Windows\System32\config\SOFTWARE'
         if (Test-Path -LiteralPath $softwareHive) {
-            $hiveLabel = 'HKLM\WWINBLDG_SOFTWARE'          # reg.exe load 用
-            $hivePath = 'HKLM:\WWINBLDG_SOFTWARE'          # PowerShell cmdlet 用
-            reg.exe load $hiveLabel $softwareHive 2>&1 | Out-Null
+            $hiveLabel = 'HKLM\WWINBLDG_SOFTWARE'
+            $hivePSDrive = 'WWINBLDG_SOFTWARE'
+            $null = reg.exe load $hiveLabel $softwareHive 2>&1 | Out-Null
             if ($LASTEXITCODE -eq 0) {
+                $psDriveExists = Get-PSDrive $hivePSDrive -ErrorAction SilentlyContinue
+                if (-not $psDriveExists) {
+                    $null = New-PSDrive -Name $hivePSDrive -PSProvider Registry -Root "HKLM:\\$hivePSDrive" -ErrorAction SilentlyContinue
+                }
                 # 遥测/诊断/隐私/性能（所有优化一次性写入）
                 $regPaths = @(
                     @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\DataCollection"; Name = 'AllowTelemetry'; Value = 0; Type = 'DWord' },
@@ -702,7 +711,7 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                 foreach ($reg in $regPaths) {
                     $keyPath = $reg.Path -replace '^HKLM\\', ''
                     if ($keyPath) {
-                        $psPath = $reg.Path -replace '^HKLM\\', 'HKLM:\'
+                        $psPath = $reg.Path -replace '^HKLM\\', "${hivePSDrive}:\\"
                         if (-not (Test-Path -LiteralPath $psPath)) {
                             New-Item -Path $psPath -Force | Out-Null
                         }
@@ -716,6 +725,7 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                         } catch { <# ignore #> }
                     }
                 }
+                $null = Remove-PSDrive -Name $hivePSDrive -ErrorAction SilentlyContinue
                 reg.exe unload $hiveLabel 2>&1 | Out-Null
                 Write-Info "SOFTWARE hive unload 结果: $LASTEXITCODE"
             }
