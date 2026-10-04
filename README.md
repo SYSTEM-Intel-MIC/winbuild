@@ -85,7 +85,6 @@ Actions → **Build Windows 11 ISO** → *Run workflow*：
 | `skip_oobe` | 开关 | **true** | 跳过 EULA / 微软账户 / 无线设置 / 隐私设置页，`ProtectYourPC=3`（依赖 `unattend`） |
 | `local_user` | 文本 | *（空）* | 预建本地管理员账户名；**留空 = 不预建**，OOBE 里手动创建 |
 | `local_password` | 文本 | *（空）* | 上面那个账户的密码（留空 = 无密码）。注意 workflow 输入公开可见 |
-| `oem_owner` | 文本 | *（空）* | `RegisteredOwner`：winver「授予 XXX」 |
 | `oem_org` | 文本 | **`SYSTEM-Intel-MIC`** | `RegisteredOrganization`：winver「组织」 |
 | `oem_provider` | 文本 | **`SYSTEM-Intel-MIC`** | `SupportProvider`：「获取帮助」里的支持提供方 |
 | `oem_url` | 文本 | **`https://space.bilibili.com/1978487514`** | `SupportURL`：「获取帮助」跳转链接；缺协议头会自动补 `https://` |
