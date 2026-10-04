@@ -213,7 +213,7 @@ jobs:
           if ('${{ inputs.office_offline }}' -eq 'true') { $p.OfficeOffline = $true }
           if ('${{ inputs.mas_activate }}' -eq 'true') { $p.MasActivate = $true }
           if ('${{ inputs.perf_tweaks }}' -eq 'true') { $p.PerfTweaks = $true }
-          foreach ($k in ($p.Keys | Sort-Object)) {
+          $p.OemOrg          = "$env:IN_OEM_ORG"
           $p.OemProvider     = "$env:IN_OEM_PROVIDER"
           $p.OemUrl          = "$env:IN_OEM_URL"
           $p.OemManufacturer = "$env:IN_OEM_MANUFACTURER"
@@ -300,9 +300,7 @@ jobs:
               } else {
                   '本次**没有**绕过 TPM / 安全启动 / 内存检查。'
               }
-              } else {
-                  '**不预建账户**，OOBE 里会让你自己创建'
-              }
+              $account = '**不预建账户**，OOBE 里会让你自己创建'
               $unattendNotes = @"
           > [!IMPORTANT]
           > 这个 ISO 根目录带 ``autounattend.xml``：$account
