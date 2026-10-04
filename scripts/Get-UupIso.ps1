@@ -598,22 +598,29 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
         ) | Select-Object -Unique
 
         $systemHive = Join-Path $mnt 'Windows\System32\config\SYSTEM'
+        Write-Info "SYSTEM hive 路径: $systemHive"
         if (Test-Path -LiteralPath $systemHive) {
-            $hiveLabel = 'HKLM\WWINBLDG_SYSTEM'          # reg.exe load 用
-            $hivePath = 'HKLM:\WWINBLDG_SYSTEM'          # PowerShell cmdlet 用
-            reg.exe load $hiveLabel $systemHive 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) {
+            $hiveLabel = 'HKLM\WWINBLDG_SYSTEM'
+            $hivePath = 'HKLM:\WWINBLDG_SYSTEM'
+            $null = reg.exe load $hiveLabel $systemHive 2>&1
+            Write-Info "SYSTEM hive load 结果: $LASTEXITCODE"
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "SYSTEM hive load 失败，跳过服务优化"
+            } else {
+                # 离线镜像没有 CurrentControlSet，改用 ControlSet001
                 foreach ($svc in $servicesToDisable) {
-                    $svcKey = "$hivePath\CurrentControlSet\Services\$svc"
+                    $svcKey = "$hivePath\ControlSet001\Services\$svc"
                     if (Test-Path -LiteralPath $svcKey) {
                         try {
                             Set-ItemProperty -LiteralPath $svcKey -Name 'Start' -Value 4 -ErrorAction Stop
                             Write-Info "已禁用服务: $svc"
-                        } catch { <# ignore failures #> }
+                        } catch { <# ignore #> }
                     }
                 }
-                reg.exe unload $hiveLabel 2>&1 | Out-Null
+                $null = reg.exe unload $hiveLabel 2>&1
             }
+        } else {
+            Write-Warning "SYSTEM hive 不存在: $systemHive"
         }
 
         # ---- 4. 注册表优化（加载 SOFTWARE hive 注入）----
