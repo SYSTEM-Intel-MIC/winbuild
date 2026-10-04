@@ -78,16 +78,6 @@ on:
         description: "跳过 OOBE 的 EULA/微软账户/无线设置/隐私设置页，ProtectYourPC=3（仍会停在本地账户创建页）"
         type: boolean
         default: true
-      local_user:
-        description: "预建本地管理员账户的用户名；留空 = 不预建，OOBE 里手动创建"
-        type: string
-        default: ""
-      local_password:
-        description: "上面那个账户的密码（留空 = 无密码）；注意 workflow 输入是公开可见的"
-        type: string
-        default: ""
-
-      # ---- OEM 信息（winver 授予者 / 获取帮助 / 注册表 OEMInformation）----
       oem_org:
         description: "RegisteredOrganization：winver「组织」"
         type: string
@@ -189,13 +179,10 @@ jobs:
           IN_EDITION: ${{ inputs.edition }}
           IN_BUILD: ${{ inputs.build }}
           IN_CHANNEL: ${{ inputs.channel }}
-          IN_LOCAL_USER: ${{ inputs.local_user }}
-          IN_LOCAL_PASSWORD: ${{ inputs.local_password }}
           IN_OEM_ORG: ${{ inputs.oem_org }}
           IN_OEM_PROVIDER: ${{ inputs.oem_provider }}
           IN_OEM_URL: ${{ inputs.oem_url }}
           IN_OEM_MANUFACTURER: ${{ inputs.oem_manufacturer }}
-          IN_OEM_MODEL: ${{ inputs.oem_model }}
           IN_OEM_LOGO: ${{ inputs.oem_logo }}
           IN_OEM_PHONE: ${{ inputs.oem_phone }}
           IN_DEEP_DEBLOAT: ${{ inputs.deep_debloat }}
@@ -226,13 +213,10 @@ jobs:
           if ('${{ inputs.office_offline }}' -eq 'true') { $p.OfficeOffline = $true }
           if ('${{ inputs.mas_activate }}' -eq 'true') { $p.MasActivate = $true }
           if ('${{ inputs.perf_tweaks }}' -eq 'true') { $p.PerfTweaks = $true }
-          $p.LocalUser       = "$env:IN_LOCAL_USER"
-          $p.LocalPassword   = "$env:IN_LOCAL_PASSWORD"
-          $p.OemOrg          = "$env:IN_OEM_ORG"
+          foreach ($k in ($p.Keys | Sort-Object)) {
           $p.OemProvider     = "$env:IN_OEM_PROVIDER"
           $p.OemUrl          = "$env:IN_OEM_URL"
           $p.OemManufacturer = "$env:IN_OEM_MANUFACTURER"
-          $p.OemModel        = "$env:IN_OEM_MODEL"
           $p.OemLogo         = "$env:IN_OEM_LOGO"
           $p.OemPhone        = "$env:IN_OEM_PHONE"
           foreach ($k in ($p.Keys | Sort-Object)) {
@@ -279,7 +263,6 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IN_LOCAL_USER: ${{ inputs.local_user }}
           IN_OEM_ORG: ${{ inputs.oem_org }}
         run: |
           # 构建号是自由文本，先清洗成合法的 tag 字符（tag/branch 不允许空格等）
@@ -317,8 +300,6 @@ jobs:
               } else {
                   '本次**没有**绕过 TPM / 安全启动 / 内存检查。'
               }
-              $account = if ($env:IN_LOCAL_USER) {
-                  ('预建本地管理员账户 ``{0}``，**装完立刻改密码**' -f $env:IN_LOCAL_USER)
               } else {
                   '**不预建账户**，OOBE 里会让你自己创建'
               }
