@@ -479,7 +479,7 @@ function Invoke-IsoReseal([System.IO.FileInfo] $Iso, [string] $Xml) {
                     & cmd.exe /c "`"$cmdBat`"" | Out-Null
                     if ($LASTEXITCODE -ne 0) { throw "wimlib 退出码 $LASTEXITCODE（第 $i/$imgCount 个镜像）" }
                 }
-                Write-Info "OEM logo 已注入 $wimFile.Name 的 $imgCount 个镜像 -> $logoInWim"
+                Write-Info "OEM logo 已注入 $($wimFile.Name) 的 $imgCount 个镜像 -> $logoInWim"
             }
         }
     } catch {
@@ -515,7 +515,9 @@ function Invoke-IsoReseal([System.IO.FileInfo] $Iso, [string] $Xml) {
     )
     Set-Content -LiteralPath $repackBat -Value $lines -Encoding Ascii
     Write-Info "cdimage 重新封盘: $cdLine"
-    & cmd.exe /c "`"$repackBat`"" 2>&1 | Tee-Object -FilePath $repackLog
+    # 必须赋值：Tee-Object 会把对象继续往下游输出，直接挂在函数里会污染本函数的返回值
+    $repackOut = @( & cmd.exe /c "`"$repackBat`"" 2>&1 | Tee-Object -FilePath $repackLog )
+    $repackOut | ForEach-Object { Write-Host $_ }
     if ($LASTEXITCODE -ne 0) {
         Write-Host "::error::cdimage 重新封盘失败，日志最后 40 行"
         Get-Content -LiteralPath $repackLog -Tail 40 -ErrorAction SilentlyContinue | Write-Host
@@ -535,7 +537,7 @@ function Invoke-IsoReseal([System.IO.FileInfo] $Iso, [string] $Xml) {
     Remove-Item -LiteralPath $tree -Recurse -Force
     Remove-Item -LiteralPath $Iso.FullName -Force
     Move-Item -LiteralPath $repacked -Destination $Iso.FullName -Force
-    return (Get-Item -LiteralPath $Iso.FullName)
+    # 副作用函数：成功输出流必须保持干净，任何东西都不许往外写（调用方用 | Out-Null 再兜一层）
 }
 
 # ---------------------------------------------------------------------------
@@ -754,7 +756,10 @@ if ($Unattend) {
         Where-Object { $_ -and $_.Trim() }
     Write-Info ("注入 autounattend.xml：免硬件检测={0} 跳过OOBE={1} 预建账户={2} OEM字段={3}个" -f `
         $HwBypass, $SkipOobe, $([bool]$LocalUser.Trim()), $oemFields.Count)
-    $isoFile = Invoke-IsoReseal -Iso $isoFile -Xml $unattendXml
+    $isoPath = $isoFile.FullName
+    # | Out-Null：只取副作用，绝不信任函数的成功输出流（历史教训：Tee-Object 污染过返回值）
+    Invoke-IsoReseal -Iso $isoFile -Xml $unattendXml | Out-Null
+    $isoFile = Get-Item -LiteralPath $isoPath
 } else {
     Write-Info "未开启 Unattend，跳过 autounattend.xml 注入"
 }
