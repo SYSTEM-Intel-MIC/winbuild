@@ -88,11 +88,19 @@ Actions → **Build Windows 11 ISO** → *Run workflow*：
 | `oem_owner` | 文本 | *（空）* | `RegisteredOwner`：winver「授予 XXX」 |
 | `oem_org` | 文本 | **`SYSTEM-Intel-MIC`** | `RegisteredOrganization`：winver「组织」 |
 | `oem_provider` | 文本 | **`SYSTEM-Intel-MIC`** | `SupportProvider`：「获取帮助」里的支持提供方 |
-| `oem_url` | 文本 | **`https://s-i-m.cc.cd`** | `SupportURL`：「获取帮助」跳转链接；缺协议头会自动补 `https://` |
+| `oem_url` | 文本 | **`https://space.bilibili.com/1978487514`** | `SupportURL`：「获取帮助」跳转链接；缺协议头会自动补 `https://` |
 | `oem_manufacturer` | 文本 | **`SYSTEM-Intel-MIC`** | `Manufacturer`（已弃用，只写注册表，Win11「设置→关于」不再显示） |
 | `oem_model` | 文本 | *（空）* | `Model`（已弃用） |
 | `oem_logo` | 文本 | *（空）* | `Logo` 路径；留空且仓库有 `OEM/logo.bmp` 时自动用 `C:\Windows\System32\oemlogo.bmp` 并把文件塞进 `install.wim` |
 | `oem_phone` | 文本 | *（空）* | `SupportPhone`（已弃用） |
+| `deep_debloat` | 开关 | **true** | 离线精简 `install.wim`：Appx 移除 + AI/Copilot/Recall 移除 + 注册表优化 + 禁用服务 |
+| `office_offline` | 开关 | **true** | 离线集成 Office 365（Word/Excel/PowerPoint），ODT 在 Action 下载，首登录静默安装 |
+| `mas_activate` | 开关 | **true** | 首登录运行 MAS 永久激活 Windows + Office |
+| `perf_tweaks` | 开关 | **true** | 额外禁用更多服务/诊断/遥测（独立开关，可单独关） |
+| `deep_debloat` | 开关 | **true** | 离线精简：Appx 移除 + AI/Copilot/Recall 移除 + 注册表优化 + 禁用服务 |
+| `office_offline` | 开关 | **true** | 离线集成 Office 365（Word/Excel/PowerPoint），ODT + 离线包在 Action 下载，首登录静默安装 |
+| `mas_activate` | 开关 | **true** | 首登录运行 MAS 永久激活 Windows + Office |
+| `perf_tweaks` | 开关 | **true** | 额外禁用更多服务/诊断/遥测（独立开关，可单独关） |
 
 架构 `x64`、语言 `zh-CN` 已固定；要改就调 `scripts/Get-UupIso.ps1 -Arch amd64 -Lang zh-cn ...`。
 
@@ -115,7 +123,7 @@ Actions → **Build Windows 11 ISO** → *Run workflow*：
 
 `unattend` 开着时，脚本会在转换完成后**把 ISO 重新封一遍盘**，把生成的 `autounattend.xml`
 放到 ISO 根目录（Windows Setup 会自动搜索安装介质根目录的 `autounattend.xml`）。
-生成的文件分两个 pass：
+生成的文件分两个 pass，并会额外写入 `SetupComplete.cmd` 与 `FirstBoot.ps1`：
 
 | pass | 内容 | 开关 |
 | --- | --- | --- |
@@ -131,6 +139,178 @@ Actions → **Build Windows 11 ISO** → *Run workflow*：
   如果装到「此电脑不符合要求」那一步被拦住，把 `hw_bypass` 关掉重跑即可（`unattend` 保持开）
 - `OEMInformation` 的 `Manufacturer` / `Model` / `Logo` / `SupportPhone` 微软已标记弃用，
   只写注册表，Win11「设置 → 关于」不再展示；`SupportURL` / `SupportProvider` 在「获取帮助」里仍然有效
+
+### 离线深度精简（`deep_debloat`）
+
+在 `install.wim` 里做以下 **全部** 修改（你可在 `scripts/Get-UupIso.ps1` 里逐项注释掉不要的）：
+
+#### ① 移除预装 Appx 包（保留核心）
+
+**保留**：
+- `Microsoft.ZuneVideo` / `Microsoft.ZuneMusic`（媒体播放器/音乐）
+- `Microsoft.MicrosoftEdge.Stable`（Edge）
+- `Microsoft.WindowsStore`（应用商店）
+- `Microsoft.Windows.Photos`（照片）
+- `Microsoft.WindowsCamera`（相机）
+- `Microsoft.ScreenSketch` / `Microsoft.SnippingTool`（截图/速记）
+- `Microsoft.Notepad`（记事本）
+- `Microsoft.MSPaint` / `Microsoft.WindowsCalculator` / `Microsoft.Alarms`（画图/计算器/闹钟）
+- `Microsoft.VCLibs.*` / `Microsoft.Media.*`（媒体扩展）
+
+**移除**：
+- Xbox 全家：`Microsoft.Xbox*` / `Microsoft.Gaming*` / `Microsoft.XboxGameOverlay`
+- 反馈/帮助：`Microsoft.Windows.FeedbackHub` / `Microsoft.GetHelp` / `Microsoft.Getstarted`
+- 广告/新闻/天气：`Microsoft.BingNews` / `Microsoft.BingWeather` / `Microsoft.BingTravel` / `Microsoft.BingSports` / `Microsoft.BingFinance`
+- Office 入口：`Microsoft.OfficeHub` / `Microsoft.GetOffice` / `Microsoft.MicrosoftOfficeHub`
+- 其他：`Microsoft.People` / `Microsoft.Skype...` / `Microsoft.Teams` / `Microsoft.OneNote` / `Microsoft.Wallet` / `Microsoft.Translator` / `Microsoft.VoiceRecorder` / `Microsoft.Solitaire...`
+
+#### ② 移除 Windows AI 功能（Capability）
+
+- `Recall`（屏幕记录/AI 分析）——**移除**
+- `Microsoft.Windows.AI.Copilot.Provider`（Copilot 核心）——**移除**
+- `Microsoft.Copilot`（旧版 Copilot）——**移除**
+- `Microsoft.Windows.Clipchamp`（AI 视频编辑）——**移除**
+- `Microsoft.Windows.Photos.AI` / `Microsoft.Windows.AppRuntime.AI`（AI 运行时）——**移除**
+
+#### ③ 禁用服务（注册表 `Start = 4` 禁用）
+
+**遥测/诊断**：
+- `DiagTrack`（Connected User Experiences and Telemetry）
+- `dmwappushservice`（Device Management WAP Push）
+- `lfsvc`（Geolocation Service）
+- `SharedAccess`（Internet Connection Sharing）
+- `RetailDemo`（Retail Demo）
+
+**与日常使用冲突/无用**：
+- `WMPNetworkSvc`（Windows Media Player Network Sharing）
+- `PhoneSvc`（Telephony）
+- `TabletInputService`（Touch Keyboard Service）
+- `MapsBroker`（Downloaded Maps Manager）
+- `WalletService`（Wallet）
+- `DPS`（Diagnostic Policy Service）
+- `PcaSvc`（Program Compatibility Assistant）
+- `CDPSvc` / `CDPUserSvc`（Connected Devices Platform）
+- `AppReadiness` / `AppXSvc` / `AppMgmt`（App 安装向导）
+- `WebClient`（WebDAV Client）
+- `RemoteRegistry`（远程注册表）
+- `TermService`（远程桌面）
+- `LanmanServer`（Server 服务）
+- `CscService`（Offline Files）
+- `EFS`（Encrypting File System）
+- `Fax`
+- `FdPHost`（Feature Discovery Platform Host）
+- `WbioSrvc`（Windows Biometric）
+
+**游戏/云服务**：
+- `GameInput` / `GameBarFTServer` / `GameDVR_Svc` / `GCSvc` / `GraphicsPerfMonitor`
+- `MicrosoftEdgeUpdate` / `MicrosoftEdgeElevation` / `MicrosoftOfficeClickToRun`
+- `XnaSvc` / `XblAuthManager` / `XblGameSave` / `XboxGipSvc` / `XboxNetApiSvc` / `XboxPcApp`
+
+**网络/隐私**：
+- `IKEEXT`（IKE and AuthIP IPsec Keying Modules）
+- `InvokerPRT`（Windows 简化身份验证）
+- `lath` / `l2tsvc`（AI 语音/L2TP）
+- `lpksetup`（Language Pack Setup）
+- `LpdPrintService`（LPD 打印服务）
+- `MpsSvc`（Windows Firewall）——可保留或删除，取决于需求
+- `MpsSvc` 我建议保留
+- `MsMpSvc`（Windows Defender 防病毒）——**不删**，保持安全
+- `MSDTC`（分布式事务协调器）
+
+> ⚠️ **保留**的关键服务：`wuauserv`（Windows Update）、`WSearch`（搜索）、`Spooler`（打印）、`Netlogon`、`NlaSvc`、`RpcSs`、`EventLog`、`PlugPlay`、`WinDefend`（如果保留 Defender）。
+
+#### ④ 注册表优化（每个键的作用）
+
+| 键 | 值 | 作用 |
+|---|---|---|
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection` | `AllowTelemetry=0` | 禁用遥测数据收集 |
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection` | `AllowDiagnosticData=0` | 禁用诊断数据 |
+| `HKLM\SOFTWARE\Policies\Microsoft\SQMClient\Windows` | `CEIPEnable=0` | 禁用客户体验改进计划 |
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows Error Reporting` | `Disabled=1` | 禁用错误报告 |
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent` | `DisableWindowsConsumerFeatures=1` | 禁用消费者功能（广告/建议） |
+| `HKLM\SOFTWARE\Microsoft\GameBar` | `GameBarEnabled=0` | 禁用 Game Bar |
+| `HKLM\SOFTWARE\Microsoft\GameBar` | `AutoGameModeEnabled=0` | 禁用自动游戏模式 |
+| `HKLM\SOFTWARE\Policies\Microsoft\GameDVR` | `AllowGameDVR=0` | 禁用 Game DVR 录制 |
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Search` | `AllowCortana=0` | 禁用 Cortana |
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Search` | `AllowCortanaAboveLock=0` | 锁屏不启用 Cortana |
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Search` | `ConnectedSearchUseWeb=0` | 搜索不连网 |
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Search` | `DisableAIDataAnalysis=1` | 禁用 AI 数据分析 |
+| `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Search` | `CortanaConsent=0` | Cortana 同意 |
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsAI` | `RemoveMicrosoftCopilotApp=1` | 移除 Copilot 应用 |
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsAI` | `DisableAIActions=1` | 禁用 AI 操作 |
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsAI` | `DisableClickToDo=1` | 禁用 Click To Do |
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Chat` | `ChatIcon=0` | 隐藏聊天图标（ Teams） |
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows\DNSClient` | `DisableSmartNameResolution=1` | 禁用智能名称解析 |
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows\DNSClient` | `DisableMulticast=1` | 禁用 DNS 多播 |
+| `HKLM\SOFTWARE\Microsoft\NCSI` | `EnableActiveProbing=0` | 禁用 NCSI 主动探测 |
+| `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer` | `HideChatIcon=1` | 隐藏聊天图标 |
+| `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer` | `NoAutoplay`=1 | 禁用自动播放 |
+| `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer` | `NoAutorun`=1 | 禁用自动运行 |
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization` | `DownloadMode=0` | 关闭传递优化（P2P 下载） |
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU` | `NoAutoUpdate`=0` | 保持自动更新（0=开启） |
+| `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU` | `AUOptions`=4 | 自动下载并安装更新 |
+
+#### ⑤ 禁用计划任务（首登录时执行）
+
+在 `FirstBoot.ps1` 里会执行以下命令禁用所有无用的计划任务：
+
+```powershell
+# 禁用遥测/诊断相关任务
+Disable-ScheduledTask -TaskPath '\Microsoft\Windows\Application Experience\StartupAppTask'
+Disable-ScheduledTask -TaskPath '\Microsoft\Windows\Customer Experience Improvement Program\Consolidator'
+Disable-ScheduledTask -TaskPath '\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip'
+Disable-ScheduledTask -TaskPath '\Microsoft\Windows\Customer Experience Improvement Program\KernelCeipTask'
+Disable-ScheduledTask -TaskPath '\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector'
+Disable-ScheduledTask -TaskPath '\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector'
+Disable-ScheduledTask -TaskPath '\Microsoft\Windows\Power Efficiency Diagnostics\AnalyzeSystem'
+Disable-ScheduledTask -TaskPath '\Microsoft\Windows\Feedback\SilentCleanup'
+Disable-ScheduledTask -TaskPath '\Microsoft\Windows\Windows Error Reporting\QueueReporting'
+Disable-ScheduledTask -TaskPath '\Microsoft\Windows\Maps\MapsUpdateTask'
+Disable-ScheduledTask -TaskPath '\Microsoft\Windows\Office\OfficeTelemetry'
+Disable-ScheduledTask -TaskPath '\Microsoft\Windows\Windows Feedback\*'
+```
+
+### Office 365 离线集成（`office_offline`）
+
+- **安装程序**：Office Deployment Tool (ODT)，由 Action 在构建时自动下载（`officedeploymenttool_16.0.20326.20112.exe`）
+- **配置文件**：`configuration.xml`，指定 `Channel=MonthlyEnterprise`、64 位、仅安装 `Word/Excel/PowerPoint`，排除 `Access/Groove/Lync/OneDrive/OneNote/Outlook/Publisher/Teams`
+- **离线包**：构建时运行 `setup.exe /download configuration.xml` 下载到 `C:\OfficeInstall\OfficeData`（约 2-4 GB，取决于更新量）
+- **集成方式**：`OfficeData` 复制到镜像的 `C:\OfficeInstall\OfficeData`
+- **安装时机**：`SetupComplete.cmd` 在 OOBE 结束后自动启动 `setup.exe /configure`（静默安装，Level=None）
+- **安装时长**：预计 5-15 分钟（首次解压 + Office 服务首次配置）
+
+### MAS 激活（`mas_activate`）
+
+- **下载**：构建时从官方 GitHub（`massgravel/Microsoft-Activation-Scripts/releases/latest`）下载 `MAS_AIO.cmd`
+- **放置**：`C:\MAS\MAS_AIO.cmd`
+- **触发**：`FirstBoot.ps1` 在 Office 安装完成后运行 `MAS_AIO.cmd`（无人值守模式：Windows HWID + Office KMS）
+- **激活方式**：
+  - Windows：HWID 永久激活（`/HWID`）
+  - Office：KMS 激活（`/OfficeKMS`），部分环境需要 VK 注入
+
+### 首登录编排器（`FirstBoot.ps1` + `SetupComplete.cmd`）
+
+**触发链**：
+1. OOBE 完成 → `SetupComplete.cmd`（`C:\Windows\Setup\Scripts\`）被系统以 SYSTEM 权限执行
+2. `SetupComplete.cmd` 后台启动 `setup.exe /configure`（Office 静默安装）
+3. `SetupComplete.cmd` 在 `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce` 创建 `SYSTEM_Intel_MIC_FirstBoot` 值
+4. 用户首次登录时，`RunOnce` 触发 `powershell -NoProfile ... FirstBoot.ps1`
+5. `FirstBoot.ps1` 显示置顶弹窗「正在安装 Office，请勿关机」
+6. 等待 Office 安装进程结束（`WaitForExit`）
+7. 启动 `MAS_AIO.cmd` 激活 Windows + Office
+8. 关闭弹窗，显示「✅ SYSTEM-Intel-MIC 优化版 Windows 11」 + 重启提示
+
+> `SetupComplete.cmd` 的脚本本身（PowerShell）在 SYSTEM 下运行，弹窗不会显示——所以 GUI 弹窗放到 `FirstBoot.ps1` 里，在用户桌面会话中运行。
+
+### 注意事项（深度精简相关）
+
+- **Office 离线包体积**：`OfficeData` 目录约 **2-4 GB**，会增大 ISO 体积（从 8.06 GB 增至约 **10-12 GB**），分卷后约 5-6 个 2 GB 分卷
+- **Action 运行时间**：Office 离线包下载（+10-20 分钟）+ 离线定制（+5-10 分钟）+ 原有转换（+45-90 分钟）= **约 60-120 分钟**，仍远低于 6 小时上限
+- **硬盘**：`OfficeData`（3 GB）+ `install.wim`（4 GB）+ `_iso_tree`（8 GB）+ `UUPs`（5 GB）+ 原 ISO（8 GB）+ 新 ISO（10-12 GB）≈ **38 GB 峰值**，Server 2022 D: 盘（通常 147 GB 空闲）足够
+- **安全**：
+  - `MAS_AIO.cmd` 来自第三方，如果担心被 Defender 误报，可把 `C:\MAS` 加入白名单（注册表 `DisableAntiSpyware` 已关闭，不影响）
+  - `SetupComplete.cmd` 启动的 `setup.exe` 为微软官方 ODT，无安全风险
+  - 离线定制会挂载 `install.wim`，失败时自动 `/Discard`
 
 ### OEM logo
 
