@@ -308,17 +308,49 @@ Hide-Aria2Noise -Path $cmdPath
 $guid = $null
 if ((Get-Content -LiteralPath $cmdPath -Raw) -match 'if "\[%1\]" == "\[([0-9a-f\-]+)\]"') { $guid = $Matches[1] }
 
+# ---------------------------------------------------------------------------
+# 【关键】修正子进程的 PSModulePath
+# Windows PowerShell 5.1 从 pwsh 派生时会继承 pwsh 放在最前面的 PowerShell 7 模块路径，
+# 5.1 的模块自动加载先命中 PS7 的 Microsoft.PowerShell.Utility（清单要求 PS 7）就失败放弃、
+# 不再向后搜索，于是 get_aria2.ps1 的 Get-FileHash 以及转换器里所有 `powershell -nop -c ...`
+# 全部 CommandNotFound（见 PowerShell/PowerShell#8635："because the Core standard module
+# path comes first"）。这里生成一个 cmd 包装脚本，只在子进程会话里换成「Windows PowerShell
+# 优先」的 PSModulePath（并剔掉 PS7 的三条），我们自己 pwsh 的环境一点不动。
+$ps7Paths = @(
+    (Join-Path $PSHOME 'Modules'),
+    (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PowerShell\Modules'),
+    (Join-Path $env:ProgramFiles 'PowerShell\Modules')
+)
+$childModulePath = (@(
+    (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell\Modules'),
+    (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'),
+    (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules')
+) + @(($env:PSModulePath -split ';') | Where-Object { $_ -and ($ps7Paths -notcontains $_) })) -join ';'
+
+$wrapperPath = Join-Path $buildDirectory '_winbuild_run.cmd'
+$wrapperLines = @(
+    '@echo off'
+    "set `"PSModulePath=$childModulePath`""
+    # 预检：模块路径没修好就立刻失败，别等到跑了一个小时才炸
+    'powershell -NoProfile -Command "if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"'
+    'if errorlevel 1 ('
+    '    echo [winbuild] FAIL: Windows PowerShell cannot load Microsoft.PowerShell.Utility'
+    '    exit /b 9'
+    ')'
+    "cd /d `"$buildDirectory`""
+)
+$wrapperLines += $(if ($guid) { "uup_download_windows.cmd $guid < NUL" } else { 'uup_download_windows.cmd < NUL' })
+$wrapperLines += 'exit /b %errorlevel%'
+Set-Content -LiteralPath $wrapperPath -Value $wrapperLines -Encoding Ascii
+
 $rawLog = Join-Path $buildDirectory 'uup_build.log'
+Write-Info "子进程 PSModulePath 已修正（以 $(Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules') 开头，已剔除 PowerShell 7 模块路径）"
 Write-Info "开始下载 UUP 文件并构建 ISO（这一步最耗时）"
 Push-Location $buildDirectory
 $prevEap = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 try {
-    if ($guid) {
-        & cmd.exe /c "uup_download_windows.cmd $guid < NUL" 2>&1 | Tee-Object -FilePath $rawLog
-    } else {
-        & cmd.exe /c "uup_download_windows.cmd < NUL" 2>&1 | Tee-Object -FilePath $rawLog
-    }
+    & cmd.exe /c "`"$wrapperPath`"" 2>&1 | Tee-Object -FilePath $rawLog
 } finally {
     $ErrorActionPreference = $prevEap
     Pop-Location
