@@ -103,7 +103,7 @@ on:
       oem_url:
         description: "SupportURL：「获取帮助」跳转链接（没有协议头会自动补 https://）"
         type: string
-        default: "https://s-i-m.cc.cd"
+        default: "https://space.bilibili.com/1978487514"
       oem_manufacturer:
         description: "Manufacturer（已弃用，写注册表 OEMInformation，Win11 设置→关于 不再显示）"
         type: string
@@ -120,6 +120,24 @@ on:
         description: "SupportPhone（已弃用）"
         type: string
         default: ""
+
+      # ---- 深度精简 / Office / MAS ----
+      deep_debloat:
+        description: "离线精简 install.wim：移除预装 Appx + 移除 AI/Copilot/Recall Capability + 注册表优化 + 禁用无用服务"
+        type: boolean
+        default: true
+      office_offline:
+        description: "离线集成 Office 365（Word/Excel/PowerPoint），ODT + 离线包在 Action 里下载，首登录自动安装"
+        type: boolean
+        default: true
+      mas_activate:
+        description: "首登录运行 MAS 永久激活 Windows + Office"
+        type: boolean
+        default: true
+      perf_tweaks:
+        description: "额外禁用更多服务/诊断/遥测（与 deep_debloat 独立，可单独开关）"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -189,6 +207,10 @@ jobs:
           IN_OEM_MODEL: ${{ inputs.oem_model }}
           IN_OEM_LOGO: ${{ inputs.oem_logo }}
           IN_OEM_PHONE: ${{ inputs.oem_phone }}
+          IN_DEEP_DEBLOAT: ${{ inputs.deep_debloat }}
+          IN_OFFICE_OFFLINE: ${{ inputs.office_offline }}
+          IN_MAS_ACTIVATE: ${{ inputs.mas_activate }}
+          IN_PERF_TWEAKS: ${{ inputs.perf_tweaks }}
         run: |
           $dest = $env:DEST_DIR
           if (-not $dest) { $dest = Join-Path $env:RUNNER_TEMP 'output' }
@@ -209,6 +231,10 @@ jobs:
           if ('${{ inputs.unattend }}' -eq 'true')  { $p.Unattend = $true }
           if ('${{ inputs.hw_bypass }}' -eq 'true') { $p.HwBypass = $true }
           if ('${{ inputs.skip_oobe }}' -eq 'true') { $p.SkipOobe = $true }
+          if ('${{ inputs.deep_debloat }}' -eq 'true') { $p.DeepDebloat = $true }
+          if ('${{ inputs.office_offline }}' -eq 'true') { $p.OfficeOffline = $true }
+          if ('${{ inputs.mas_activate }}' -eq 'true') { $p.MasActivate = $true }
+          if ('${{ inputs.perf_tweaks }}' -eq 'true') { $p.PerfTweaks = $true }
           $p.LocalUser       = "$env:IN_LOCAL_USER"
           $p.LocalPassword   = "$env:IN_LOCAL_PASSWORD"
           $p.OemOwner        = "$env:IN_OEM_OWNER"
