@@ -914,7 +914,8 @@ $win.Dispatcher.Invoke([Action]{ $win.Close() })
         }
 
         # ---- 7. 卸载并提交 ----
-        dism.exe /Unmount-Wim /MountDir:$mnt /Commit 2>&1 | Out-Null
+        Write-Info "开始提交 DISM 镜像..."
+        dism.exe /Unmount-Wim /MountDir:$mnt /Commit 2>&1 | ForEach-Object { Write-Host $_ }
         if ($LASTEXITCODE -ne 0) { throw "dism /Unmount-Wim /Commit 失败，退出码 $LASTEXITCODE" }
         Write-Info "离线精简/集成完成"
     } catch {
