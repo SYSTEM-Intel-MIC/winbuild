@@ -1,0 +1,235 @@
+name: Build Windows 11 ISO
+
+run-name: "Win11 ${{ inputs.build }} ${{ inputs.channel }} x64 zh-CN (${{ inputs.edition }}) via UUP dump"
+
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: >-
+          构建号（可手填）：填 26220 = 该版本最新修订；也可填精确版本 26220.9587。
+          查最新：打开 https://uupdump.net/ 首页 Downloads 列表，看 amd64 行括号里的数字
+          （如 "Windows 11 Insider Preview Feature Update (26220.9587) amd64"）；
+          也可用 https://uupdump.net/known.php?q=关键词 搜索，如 category:w11-26h2。
+        type: string
+        default: "26220"
+        required: true
+      channel:
+        description: "构建通道：insider=Dev/Beta/Canary 预览版（26220 属于 Dev）；stable=正式版（title 含 version 26H2 之类）"
+        type: choice
+        options:
+          - insider
+          - stable
+        default: insider
+        required: true
+      edition:
+        description: "版本：pro=专业版 / enterprise=仅企业版 / enterprise_pro=专业版+企业版 / multi=家庭版+专业版"
+        type: choice
+        options:
+          - pro
+          - enterprise
+          - enterprise_pro
+          - multi
+        default: pro
+        required: true
+      updates:
+        description: "集成最新累积更新（UUP dump 下载更新包）"
+        type: boolean
+        default: true
+      netfx3:
+        description: "预装 .NET Framework 3.5"
+        type: boolean
+        default: true
+      esd:
+        description: "ESD 固体压缩（镜像更小，转换更慢）"
+        type: boolean
+        default: false
+      reset_base:
+        description: "ResetBase 组件基线重置（镜像更小，更慢）"
+        type: boolean
+        default: true
+      skip_apps:
+        description: "跳过预装 Store 应用 SkipApps（镜像更小更干净，但没有商店和内置 Appx）"
+        type: boolean
+        default: false
+      skip_edge:
+        description: "跳过 Edge 集成 SkipEdge"
+        type: boolean
+        default: false
+      drivers:
+        description: "注入仓库 Drivers/ 目录下的驱动（AddDrivers，需要仓库里放了驱动文件）"
+        type: boolean
+        default: false
+      wim2swm:
+        description: "install.wim 拆分成 install.swm（WIM 分卷；esd 开启时无效）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-win11-x64-zh-cn
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ISO
+    runs-on: windows-2025
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check disk space
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem |
+            Where-Object { $_.Free } |
+            ForEach-Object { Write-Host ("{0}  空闲 {1:N1} GB" -f $_.Root, ($_.Free / 1GB)) }
+
+          # 预装但本次构建完全用不到的大块头，能删就删，给 UUP 下载和转换留足空间
+          $targets = @(
+            'C:\Android',
+            'C:\SeleniumWebDrivers',
+            'C:\R',
+            'C:\Program Files\MongoDB',
+            'C:\Program Files\PostgreSQL',
+            "$env:LOCALAPPDATA\pip\cache",
+            "$env:LOCALAPPDATA\NuGet",
+            'C:\Program Files (x86)\Microsoft SDKs\Azure'
+          )
+          foreach ($t in $targets) {
+            if (Test-Path -LiteralPath $t) {
+              Write-Host "清理 $t"
+              Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          # 选剩余空间最大的盘做输出目录（老镜像有 D:，Server 2025 镜像只有 C:）
+          $drive = Get-PSDrive -PSProvider FileSystem |
+            Where-Object { $_.Free -gt 0 } |
+            Sort-Object Free -Descending |
+            Select-Object -First 1
+          $dest = Join-Path $drive.Root 'output'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Write-Host "输出目录: $dest（空闲 $([math]::Round($drive.Free / 1GB, 1)) GB）"
+          "DEST_DIR=$dest" | Add-Content $env:GITHUB_ENV
+
+      - name: Build ISO from UUP dump
+        shell: pwsh
+        run: |
+          $dest = $env:DEST_DIR
+          if (-not $dest) { $dest = Join-Path $env:RUNNER_TEMP 'output' }
+          $p = @{
+            Edition     = '${{ inputs.edition }}'
+            Destination = $dest
+            Build       = '${{ inputs.build }}'
+            Channel     = '${{ inputs.channel }}'
+          }
+          if ('${{ inputs.updates }}' -eq 'false')    { $p.NoUpdates   = $true }
+          if ('${{ inputs.netfx3 }}' -eq 'true')      { $p.NetFx3      = $true }
+          if ('${{ inputs.esd }}' -eq 'true')         { $p.Esd         = $true }
+          if ('${{ inputs.reset_base }}' -eq 'false') { $p.NoResetBase = $true }
+          if ('${{ inputs.skip_apps }}' -eq 'true')   { $p.SkipApps    = $true }
+          if ('${{ inputs.skip_edge }}' -eq 'true')   { $p.SkipEdge    = $true }
+          if ('${{ inputs.drivers }}' -eq 'true')     { $p.Drivers     = $true }
+          if ('${{ inputs.wim2swm }}' -eq 'true')     { $p.Wim2Swm     = $true }
+          foreach ($k in ($p.Keys | Sort-Object)) { Write-Host "  参数 $k = $($p[$k])" }
+          & ./scripts/Get-UupIso.ps1 @p
+
+      - name: Split ISO into 2GB parts
+        shell: pwsh
+        run: |
+          if (-not $env:ISO_PATH) { throw 'ISO_PATH 未设置，构建步骤没有产出' }
+          $iso = Get-Item -LiteralPath $env:ISO_PATH
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          if (-not (Test-Path $sevenZip)) { $sevenZip = '7z.exe' }
+
+          $free = Get-PSDrive -PSProvider FileSystem |
+            Where-Object { $iso.FullName.StartsWith($_.Root) } | Select-Object -First 1
+          if ($free) { Write-Host "分卷前空闲空间 $($free.Root): $([math]::Round($free.Free / 1GB, 1)) GB" }
+
+          # 在 ISO 所在目录内执行，保证分卷包里只存文件名而不是完整路径
+          $archive = Join-Path $iso.DirectoryName ($iso.BaseName + '.iso.zip')
+          Write-Host "分卷: $($iso.Name) -> $($iso.BaseName).iso.zip.001 ..."
+          Push-Location $iso.DirectoryName
+          try {
+              & $sevenZip a -v2000m -mx=0 -bso0 -bsp0 ($iso.BaseName + '.iso.zip') $iso.Name
+              $code = $LASTEXITCODE
+          } finally {
+              Pop-Location
+          }
+          if ($code -ne 0) { throw "7z 分卷失败，退出码 $code" }
+
+          $parts = @(Get-ChildItem -Path "$archive.*" -File)
+          if ($parts.Count -eq 0) { throw '没有生成分卷文件' }
+          $parts | ForEach-Object { Write-Host ("  {0}  {1} MB" -f $_.Name, [math]::Round($_.Length / 1MB, 1)) }
+
+          # 分卷已校验在手，删掉原始 ISO 给发布步骤腾空间（Release 单文件上限 2GB，只能发分卷）
+          Remove-Item -LiteralPath $iso.FullName -Force
+
+          "PARTS_GLOB=$archive.*" | Add-Content $env:GITHUB_ENV
+          "PARTS_DIR=$($iso.DirectoryName)" | Add-Content $env:GITHUB_ENV
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 构建号是自由文本，先清洗成合法的 tag 字符（tag/branch 不允许空格等）
+          $buildIn = '${{ inputs.build }}' -replace '[^A-Za-z0-9._-]', '-'
+          $tag = "Win11_${buildIn}-${{ inputs.channel }}_x64_zh-CN_${{ inputs.edition }}_$($env:ISO_BUILD)_$(Get-Date -Format yyyyMMdd)"
+          $title = "Windows 11 $env:ISO_BUILD (${{ inputs.channel }}) x64 zh-CN ${{ inputs.edition }}"
+          $parts = @(Get-ChildItem -Path $env:PARTS_GLOB -File)
+          $files = @($parts.FullName) + @("$($env:ISO_PATH).sha256.txt")
+
+          $options = @()
+          if ('${{ inputs.updates }}' -eq 'true')    { $options += '集成最新累积更新' }
+          if ('${{ inputs.netfx3 }}' -eq 'true')     { $options += '.NET 3.5 预装' }
+          if ('${{ inputs.esd }}' -eq 'true')        { $options += 'ESD 压缩' }
+          if ('${{ inputs.reset_base }}' -eq 'true') { $options += 'ResetBase' }
+          if ('${{ inputs.skip_apps }}' -eq 'true')  { $options += '跳过预装应用' }
+          if ('${{ inputs.skip_edge }}' -eq 'true')  { $options += '跳过 Edge' }
+          if ('${{ inputs.drivers }}' -eq 'true')    { $options += '注入 Drivers 驱动' }
+          if ('${{ inputs.wim2swm }}' -eq 'true')    { $options += 'WIM 分卷' }
+          if (-not $options) { $options = '默认（无附加选项）' }
+
+          $notes = @"
+          ## $title
+
+          | 属性 | 值 |
+          | --- | --- |
+          | 构建 | ``$($env:ISO_BUILD)`` |
+          | 版本 | $($env:ISO_TITLE) |
+          | 通道 | ``${{ inputs.channel }}``（输入构建号 ``${{ inputs.build }}``） |
+          | 版本 SKU | ``${{ inputs.edition }}`` |
+          | 语言 | zh-CN |
+          | 架构 | x64 |
+          | 镜像内版本 | $($env:ISO_IMAGES) |
+          | 大小 | $([math]::Round([double]$env:ISO_SIZE / 1GB, 2)) GB |
+          | 选项 | $($options -join '、') |
+          | SHA256 | ``$($env:ISO_SHA256)`` |
+          | 来源 | [UUP dump]($($env:UUP_URL)) |
+
+          ### 下载与合并
+
+          1. 下载全部 ``.001`` / ``.002`` / ``.003`` 分卷到同一目录
+          2. 用 7-Zip 打开 ``.001`` 解出 ISO：``7z x "$($env:ISO_NAME).zip.001"``（或 ``copy /b`` 拼接）
+          3. 校验 SHA256 与上表一致
+          "@
+
+          $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          Set-Content -LiteralPath $notesPath -Value $notes -Encoding utf8
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+              Write-Host "Release $tag 已存在，覆盖上传分卷"
+              gh release upload $tag @files --clobber
+          } else {
+              gh release create $tag @files --title $title --notes-file $notesPath
+          }
+          if ($LASTEXITCODE) { throw "发布 Release 失败，退出码 $LASTEXITCODE" }
+          Write-Host "已发布: https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$tag"
+
+          Add-Content $env:GITHUB_STEP_SUMMARY $notes

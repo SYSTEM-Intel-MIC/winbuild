@@ -1,0 +1,10 @@
+# 构建产物不入库
+output/
+*.iso
+*.iso.*
+*.esd
+*.wim
+*.log
+uup-package.zip
+release-notes.md
+.local/
