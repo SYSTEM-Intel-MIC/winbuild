@@ -618,6 +618,7 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                     }
                 }
                 $null = reg.exe unload $hiveLabel 2>&1
+                Write-Info "SYSTEM hive unload 结果: $LASTEXITCODE"
             }
         } else {
             Write-Warning "SYSTEM hive 不存在: $systemHive"
@@ -716,6 +717,7 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                     }
                 }
                 reg.exe unload $hiveLabel 2>&1 | Out-Null
+                Write-Info "SOFTWARE hive unload 结果: $LASTEXITCODE"
             }
         }
 
