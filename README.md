@@ -134,14 +134,13 @@ Actions → **Build Windows 11 ISO** → *Run workflow*：
 
 ### OEM logo
 
-把图片放到仓库 `OEM/logo.bmp`（也支持 `.png` / `.jpg`，建议 96×96），构建时会：
+把图片放到仓库 `OEM/logo.bmp`（也支持 `.png` / `.jpg`，24 位 BMP、96～120px 见方最合适），构建时会：
 
 1. `wimlib-imagex update` 把它写进 `install.wim` 的 `\Windows\System32\oemlogo.bmp`（**所有**镜像索引都会写）
 2. `OEMInformation\Logo` 自动设成 `C:\Windows\System32\oemlogo.bmp`
 
 > 只对 `install.wim` 有效；开 `esd` 或 `wim2swm` 时没有 `install.wim`，会打警告并跳过（其他 OEM 字段照常写）。
-> 仓库里的 `OEM/logo.bmp` 是占位图，换成你自己的即可。
-
+> 注入失败也只警告、不中断构建（装出来的系统只是没有 logo）。
 
 ## 产物
 
