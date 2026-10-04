@@ -7,15 +7,15 @@ on:
     inputs:
       build:
         description: >-
-          构建号（可手填）：填 26220 = 该版本最新修订；也可填精确版本 26220.9587。
+          构建号（可手填）：填 28020 = 该版本最新修订；也可填精确版本 28020.3142。
           查最新：打开 https://uupdump.net/ 首页 Downloads 列表，看 amd64 行括号里的数字
-          （如 "Windows 11 Insider Preview Feature Update (26220.9587) amd64"）；
-          也可用 https://uupdump.net/known.php?q=关键词 搜索，如 category:w11-26h2。
+          （如 "Windows 11 Insider Preview Feature Update (28020.3142) amd64"）；
+          也可用 https://uupdump.net/known.php?q=关键词 搜索，如 category:w11-26h1。
         type: string
-        default: "26220"
+        default: "28020"
         required: true
       channel:
-        description: "构建通道：insider=Dev/Beta/Canary 预览版（26220 属于 Dev）；stable=正式版（title 含 version 26H2 之类）"
+        description: "构建通道：insider=Dev/Beta/Canary 预览版（28020 属于 Beta 频道的 26H1 分支）；stable=正式版（title 含 version 26H2 之类）"
         type: choice
         options:
           - insider
@@ -64,6 +64,62 @@ on:
         description: "install.wim 拆分成 install.swm（WIM 分卷；esd 开启时无效）"
         type: boolean
         default: false
+
+      # ---- 无人值守：注入 autounattend.xml 并用 cdimage 重新封盘 ----
+      unattend:
+        description: "注入 autounattend.xml 到 ISO 根目录（无人值守安装；关闭则 ISO 原样出厂）"
+        type: boolean
+        default: true
+      hw_bypass:
+        description: "免硬件检测：windowsPE 阶段写 LabConfig，绕过 TPM/安全启动/内存检查（仅 unattend 开启时生效）"
+        type: boolean
+        default: true
+      skip_oobe:
+        description: "跳过 OOBE 的 EULA/微软账户/无线设置/隐私设置页，ProtectYourPC=3（仍会停在本地账户创建页）"
+        type: boolean
+        default: true
+      local_user:
+        description: "预建本地管理员账户的用户名；留空 = 不预建，OOBE 里手动创建"
+        type: string
+        default: ""
+      local_password:
+        description: "上面那个账户的密码（留空 = 无密码）；注意 workflow 输入是公开可见的"
+        type: string
+        default: ""
+
+      # ---- OEM 信息（winver 授予者 / 获取帮助 / 注册表 OEMInformation）----
+      oem_owner:
+        description: "RegisteredOwner：winver「授予 XXX」"
+        type: string
+        default: ""
+      oem_org:
+        description: "RegisteredOrganization：winver「组织」"
+        type: string
+        default: "SYSTEM-Intel-MIC"
+      oem_provider:
+        description: "SupportProvider：「获取帮助」显示的支持提供方"
+        type: string
+        default: "SYSTEM-Intel-MIC"
+      oem_url:
+        description: "SupportURL：「获取帮助」跳转链接（没有协议头会自动补 https://）"
+        type: string
+        default: "https://s-i-m.cc.cd"
+      oem_manufacturer:
+        description: "Manufacturer（已弃用，写注册表 OEMInformation，Win11 设置→关于 不再显示）"
+        type: string
+        default: "SYSTEM-Intel-MIC"
+      oem_model:
+        description: "Model（已弃用）"
+        type: string
+        default: ""
+      oem_logo:
+        description: "Logo 路径；留空且仓库存在 OEM/logo.bmp 时自动用 C:\\Windows\\System32\\oemlogo.bmp 并把文件塞进 install.wim"
+        type: string
+        default: ""
+      oem_phone:
+        description: "SupportPhone（已弃用）"
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -118,14 +174,29 @@ jobs:
 
       - name: Build ISO from UUP dump
         shell: pwsh
+        env:
+          # 走环境变量传参，避免输入值被拼进脚本源码
+          IN_EDITION: ${{ inputs.edition }}
+          IN_BUILD: ${{ inputs.build }}
+          IN_CHANNEL: ${{ inputs.channel }}
+          IN_LOCAL_USER: ${{ inputs.local_user }}
+          IN_LOCAL_PASSWORD: ${{ inputs.local_password }}
+          IN_OEM_OWNER: ${{ inputs.oem_owner }}
+          IN_OEM_ORG: ${{ inputs.oem_org }}
+          IN_OEM_PROVIDER: ${{ inputs.oem_provider }}
+          IN_OEM_URL: ${{ inputs.oem_url }}
+          IN_OEM_MANUFACTURER: ${{ inputs.oem_manufacturer }}
+          IN_OEM_MODEL: ${{ inputs.oem_model }}
+          IN_OEM_LOGO: ${{ inputs.oem_logo }}
+          IN_OEM_PHONE: ${{ inputs.oem_phone }}
         run: |
           $dest = $env:DEST_DIR
           if (-not $dest) { $dest = Join-Path $env:RUNNER_TEMP 'output' }
           $p = @{
-            Edition     = '${{ inputs.edition }}'
+            Edition     = $env:IN_EDITION
             Destination = $dest
-            Build       = '${{ inputs.build }}'
-            Channel     = '${{ inputs.channel }}'
+            Build       = $env:IN_BUILD
+            Channel     = $env:IN_CHANNEL
           }
           if ('${{ inputs.updates }}' -eq 'false')    { $p.NoUpdates   = $true }
           if ('${{ inputs.netfx3 }}' -eq 'true')      { $p.NetFx3      = $true }
@@ -135,7 +206,23 @@ jobs:
           if ('${{ inputs.skip_edge }}' -eq 'true')   { $p.SkipEdge    = $true }
           if ('${{ inputs.drivers }}' -eq 'true')     { $p.Drivers     = $true }
           if ('${{ inputs.wim2swm }}' -eq 'true')     { $p.Wim2Swm     = $true }
-          foreach ($k in ($p.Keys | Sort-Object)) { Write-Host "  参数 $k = $($p[$k])" }
+          if ('${{ inputs.unattend }}' -eq 'true')  { $p.Unattend = $true }
+          if ('${{ inputs.hw_bypass }}' -eq 'true') { $p.HwBypass = $true }
+          if ('${{ inputs.skip_oobe }}' -eq 'true') { $p.SkipOobe = $true }
+          $p.LocalUser       = "$env:IN_LOCAL_USER"
+          $p.LocalPassword   = "$env:IN_LOCAL_PASSWORD"
+          $p.OemOwner        = "$env:IN_OEM_OWNER"
+          $p.OemOrg          = "$env:IN_OEM_ORG"
+          $p.OemProvider     = "$env:IN_OEM_PROVIDER"
+          $p.OemUrl          = "$env:IN_OEM_URL"
+          $p.OemManufacturer = "$env:IN_OEM_MANUFACTURER"
+          $p.OemModel        = "$env:IN_OEM_MODEL"
+          $p.OemLogo         = "$env:IN_OEM_LOGO"
+          $p.OemPhone        = "$env:IN_OEM_PHONE"
+          foreach ($k in ($p.Keys | Sort-Object)) {
+            $v = if ($k -eq 'LocalPassword') { '***' } else { $p[$k] }
+            Write-Host "  参数 $k = $v"
+          }
           & ./scripts/Get-UupIso.ps1 @p
 
       - name: Split ISO into 2GB parts
@@ -176,6 +263,8 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IN_LOCAL_USER: ${{ inputs.local_user }}
+          IN_OEM_ORG: ${{ inputs.oem_org }}
         run: |
           # 构建号是自由文本，先清洗成合法的 tag 字符（tag/branch 不允许空格等）
           $buildIn = '${{ inputs.build }}' -replace '[^A-Za-z0-9._-]', '-'
@@ -193,7 +282,34 @@ jobs:
           if ('${{ inputs.skip_edge }}' -eq 'true')  { $options += '跳过 Edge' }
           if ('${{ inputs.drivers }}' -eq 'true')    { $options += '注入 Drivers 驱动' }
           if ('${{ inputs.wim2swm }}' -eq 'true')    { $options += 'WIM 分卷' }
+          if ('${{ inputs.unattend }}' -eq 'true') {
+              $options += '无人值守 autounattend.xml'
+              if ('${{ inputs.hw_bypass }}' -eq 'true') { $options += '免 TPM/安全启动/内存检测' }
+              if ('${{ inputs.skip_oobe }}' -eq 'true') { $options += '跳过 OOBE' }
+              if ($env:IN_OEM_ORG) { $options += "OEM 信息（组织=$env:IN_OEM_ORG）" }
+          }
           if (-not $options) { $options = '默认（无附加选项）' }
+
+          $unattendNotes = ''
+          if ('${{ inputs.unattend }}' -eq 'true') {
+              $hwLine = if ('${{ inputs.hw_bypass }}' -eq 'true') {
+                  'windowsPE 阶段写 ``HKLM\SYSTEM\Setup\LabConfig``，绕过 **TPM / 安全启动 / 内存** 检查。'
+              } else {
+                  '本次**没有**绕过 TPM / 安全启动 / 内存检查。'
+              }
+              $account = if ($env:IN_LOCAL_USER) {
+                  ('预建本地管理员账户 ``{0}``，**装完立刻改密码**' -f $env:IN_LOCAL_USER)
+              } else {
+                  '**不预建账户**，OOBE 里会让你自己创建'
+              }
+              $unattendNotes = @"
+          > [!IMPORTANT]
+          > 这个 ISO 根目录带 ``autounattend.xml``：$account
+          > $hwLine
+          > 会跳过 EULA / 微软账户 / 无线设置 / 隐私设置页并设 ``ProtectYourPC=3``；
+          > 分区选择仍然由你手动操作，不会自动动磁盘。
+          "@
+          }
 
           $notes = @"
           ## $title
@@ -211,6 +327,8 @@ jobs:
           | 选项 | $($options -join '、') |
           | SHA256 | ``$($env:ISO_SHA256)`` |
           | 来源 | [UUP dump]($($env:UUP_URL)) |
+
+          $unattendNotes
 
           ### 下载与合并
 
