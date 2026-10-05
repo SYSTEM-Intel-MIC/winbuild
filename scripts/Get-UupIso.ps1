@@ -1179,16 +1179,32 @@ function Invoke-IsoReseal([System.IO.FileInfo] $Iso, [string] $Xml) {
             Write-Info "ESD 重打包：install.wim 的 $imgCount 个镜像 -> install.esd（LZMS solid，这步很吃 CPU，可能要十几分钟）"
             $esdWatch = [System.Diagnostics.Stopwatch]::StartNew()
             $esdOk = $true
+            # 单镜像导出上限 90 分钟：LZMS solid 压 9GB 在 2 核 runner 上很慢，
+            # 一旦超时立刻放弃 ESD 改用 wim 封盘。绝不能用 `& dism` 无限期等——
+            # 上一轮就是这么把整轮构建挂了近 5 小时，最后只能取消。
+            $esdTimeoutMs = 90 * 60 * 1000
             for ($i = 1; $i -le $imgCount -and $esdOk; $i++) {
+                # 不加 /CheckIntegrity：它会对整个 9GB 源做全量校验，白花几十分钟，
+                # 而源 wim 是本流程刚生成并提交过的，没有损坏风险。
                 $dismArgs = @('/Export-Image', "/SourceImageFile:$wimPath", "/SourceIndex:$i",
-                              "/DestinationImageFile:$esdPath", '/Compress:recovery', '/CheckIntegrity')
+                              "/DestinationImageFile:$esdPath", '/Compress:recovery')
                 # 目标文件已存在时必须显式给 DestinationIndex，否则第二个镜像导不进去
                 if ($i -gt 1) { $dismArgs += "/DestinationIndex:$i" }
-                Write-Info "  导出镜像 $i/$imgCount ..."
-                & dism.exe @dismArgs 2>&1 | ForEach-Object { Write-Host $_ }
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Warning "  镜像 $i 导出失败（退出码 $LASTEXITCODE）"
+                Write-Info "  导出镜像 $i/$imgCount （LZMS solid，上限 90 分钟，超时自动回退 wim）..."
+                $swOne = [System.Diagnostics.Stopwatch]::StartNew()
+                $proc = Start-Process -FilePath 'dism.exe' -ArgumentList $dismArgs -NoNewWindow -PassThru
+                $finished = $proc.WaitForExit($esdTimeoutMs)
+                $swOne.Stop()
+                $mins = [int]$swOne.Elapsed.TotalMinutes
+                if (-not $finished) {
+                    try { $proc.Kill($true) } catch { try { $proc.Kill() } catch { } }
+                    Write-Warning "  镜像 $i 导出超时（$mins 分钟），已强制结束，回退用 wim 封盘"
                     $esdOk = $false
+                } elseif ($proc.ExitCode -ne 0) {
+                    Write-Warning "  镜像 $i 导出失败（退出码 $($proc.ExitCode)，耗时 $mins 分钟）"
+                    $esdOk = $false
+                } else {
+                    Write-Info "  镜像 $i 导出完成（耗时 $mins 分钟）"
                 }
             }
             $esdWatch.Stop()
