@@ -57,7 +57,32 @@ jobs:
           $arm | ForEach-Object { Write-Host "  删 $($_.Name) ($([math]::Round($_.Length/1MB,1)) MB)" }
           $arm | Remove-Item -Force
 
-          Write-Host "`n=== 跑 setup /configure（本地源 C:\OfficeInstall）==="
+          # --- 关键：屏蔽 Office CDN，逼 setup 只能读本地源 ---
+          # 上一版用日志里的 TransferredBytes 判断联网是错的：本地拷贝也记这个字段，
+          # 而且装机时网络是通的，根本分不清是读本地还是从 CDN 重下（重下的话删掉的
+          # 451 MB 会在目标机上被重新拉回来，白省）。hosts 一屏蔽就只剩一条路。
+          $hosts = 'C:\Windows\System32\drivers\etc\hosts'
+          $block = @(
+            '127.0.0.1 officecdn.microsoft.com',
+            '127.0.0.1 officecdn-cn.microsoft.com',
+            '127.0.0.1 f.c2r.ts.cdn.office.net',
+            '127.0.0.1 office15client.microsoft.com'
+          )
+          Add-Content -LiteralPath $hosts -Value ("`n# WINBUILD-OFFICE-CDN-BLOCK`n" + ($block -join "`n"))
+          ipconfig /flushdns | Out-Null
+          Write-Host "`n=== 已屏蔽 Office CDN（hosts）==="
+          foreach ($d in @('officecdn.microsoft.com','f.c2r.ts.cdn.office.net')) {
+            $ok = $false
+            try { $null = [System.Net.Dns]::GetHostAddresses($d); $ok = $true } catch { }
+            $ip = try { (([System.Net.Dns]::GetHostAddresses($d) | Select-Object -First 1).IPAddressToString) } catch { '解析失败' }
+            Write-Host "  $d -> $ip"
+          }
+          Write-Host "  CDN 可达性测试（curl 应该失败）:"
+          & curl.exe -s -o NUL -w "    HTTP=%{http_code} connect=%{time_connect}s`n" --max-time 15 `
+              "http://officecdn.microsoft.com/pr/55336b82-a18d-4dd6-b5f6-9e5095c314a6/office/data/16.0.20326.20142/v64.cab"
+          if ($LASTEXITCODE -eq 0) { Write-Host "    警告：CDN 仍可达，本次离线判定不可信" } else { Write-Host "    CDN 已不可达（curl 退出码 $LASTEXITCODE）-> 离线判定可信" }
+
+          Write-Host "`n=== 跑 setup /configure（本地源 C:\OfficeInstall，CDN 已屏蔽）==="
           $sw = [System.Diagnostics.Stopwatch]::StartNew()
           $p = Start-Process -FilePath (Join-Path $img 'setup.exe') `
                    -ArgumentList "/configure `"$img\configuration.xml`"" -Wait -PassThru
@@ -72,24 +97,22 @@ jobs:
             if ($hit) { Write-Host "  OK  $exe -> $($hit.FullName)" } else { Write-Host "  缺失 $exe" }
           }
 
-          Write-Host "`n=== 语言（应该有 zh-cn，不应该有 en-us）==="
+          Write-Host "`n=== 语言（权威判定：注册表 ClientCulture，应该 zh-CN）==="
+          $cc = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' `
+                      -Name ClientCulture -ErrorAction SilentlyContinue).ClientCulture
+          Write-Host "  ClientCulture = $cc"
+          $root = 'C:\Program Files\Microsoft Office\root\Office16'
           if (Test-Path $root) {
+            Write-Host "  Office16 下的语言目录:"
             Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -match 'zh-cn|en-us' } | ForEach-Object { Write-Host "  $($_.Name)" }
+              ForEach-Object { Write-Host "    $($_.Name)" }
+          } else {
+            Write-Host "  没找到 $root"
           }
 
-          Write-Host "`n=== 是否偷偷联网下了东西（Transport 传输量 > 1 MB 即视为没做到离线）==="
-          $big = $false
-          Get-ChildItem -Path $env:TEMP -Recurse -Depth 2 -Filter '*.log' -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-30) } |
-            ForEach-Object {
-              Select-String -LiteralPath $_.FullName -Pattern 'TransferredBytes\\?":\s*"?(\d{7,})' -AllMatches |
-                ForEach-Object { $_.Matches } | ForEach-Object {
-                  $bytes = [int64]$_.Groups[1].Value
-                  if ($bytes -gt 1MB) { Write-Host "  联网传输 $([math]::Round($bytes/1MB,1)) MB"; $script:big = $true }
-                }
-            }
-          if (-not $big) { Write-Host "  未发现大于 1MB 的联网下载 -> 本地源离线安装成立" }
+          Write-Host "`n=== 离线判定 ==="
+          Write-Host "  CDN 已在安装前屏蔽，因此：退出码 0 + 三个 exe 齐全 = 纯本地源离线安装成立"
+          Write-Host "  若退出码非 0 或缺 exe = 这个包不完整/必须要联网"
 
           Write-Host "`n=== C2R 日志里的错误 ==="
           Get-ChildItem -Path $env:TEMP -Recurse -Depth 2 -Filter '*.log' -File -ErrorAction SilentlyContinue |
