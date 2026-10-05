@@ -75,7 +75,7 @@ on:
         type: boolean
         default: true
       skip_oobe:
-        description: "跳过 OOBE 的 EULA/微软账户/无线设置/隐私设置页，ProtectYourPC=3（仍会停在本地账户创建页）"
+        description: "跳过 OOBE 的 EULA/联网强制/微软账户/无线设置/隐私设置页，ProtectYourPC=3；并写 BypassNRO=1 让断网也能直接建本地账户"
         type: boolean
         default: true
       oem_org:
@@ -171,6 +171,25 @@ jobs:
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           Write-Host "输出目录: $dest（空闲 $([math]::Round($drive.Free / 1GB, 1)) GB）"
           "DEST_DIR=$dest" | Add-Content $env:GITHUB_ENV
+
+      - name: Start Office offline pre-download (parallel with UUP)
+        if: ${{ inputs.office_offline }}
+        shell: pwsh
+        run: |
+          # 与后面 UUP 下载/转换**并行**下载 Office（约 3.5 GB），
+          # 主脚本在离线集成阶段轮询 OFFICE_DL_DONE 标记，直接把结果搬进镜像。
+          $dir = Join-Path $env:DEST_DIR 'office_dl'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $log  = Join-Path $dir 'office_dl.log'
+          $err  = Join-Path $dir 'office_dl.err.log'
+          $ps   = (Get-Process -Id $PID).Path
+          $proc = Start-Process -FilePath $ps `
+                    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'scripts/Download-Office.ps1', '-WorkDir', $dir) `
+                    -WorkingDirectory $env:GITHUB_WORKSPACE `
+                    -RedirectStandardOutput $log -RedirectStandardError $err `
+                    -WindowStyle Hidden -PassThru
+          Write-Host "Office 预下载已在后台启动（PID $($proc.Id)）: $dir"
+          Write-Host "日志: $log"
 
       - name: Build ISO from UUP dump
         shell: pwsh
