@@ -622,6 +622,8 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                     }
                 }
                 $null = Remove-PSDrive -Name $hivePSDrive -ErrorAction SilentlyContinue
+                [System.GC]::Collect()
+                Start-Sleep -Milliseconds 500
                 $null = reg.exe unload $hiveLabel 2>&1
                 Write-Info "SYSTEM hive unload 结果: $LASTEXITCODE"
             }
@@ -726,6 +728,8 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                     }
                 }
                 $null = Remove-PSDrive -Name $hivePSDrive -ErrorAction SilentlyContinue
+                [System.GC]::Collect()
+                Start-Sleep -Milliseconds 500
                 reg.exe unload $hiveLabel 2>&1 | Out-Null
                 Write-Info "SOFTWARE hive unload 结果: $LASTEXITCODE"
             }
