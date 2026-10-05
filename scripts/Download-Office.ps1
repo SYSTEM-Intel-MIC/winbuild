@@ -48,7 +48,11 @@ $ConfigurationTemplate = @'
 <Configuration>
   <Add OfficeClientEdition="64" Channel="MonthlyEnterprise" SourcePath="__SRCPATH__">
     <Product ID="O365ProPlusRetail">
-      <Language ID="MatchOS" />
+      <!-- 必须写死 zh-cn：MatchOS 是「按运行 setup.exe 的那台机器的 OS 语言」在下载阶段就解析掉，
+           GitHub runner 是 en-US，会下成英文包（日志里会出现 stream.x64.en-us.dat / *1033.cab），
+           装到 zh-CN 目标机上时 ODT 找不到 zh-cn 流就得联网补下，离线集成就废了。
+           本 ISO 就是 zh-CN 版，所以下载和安装都固定 zh-cn。 -->
+      <Language ID="zh-cn" />
       <ExcludeApp ID="Access" />
       <ExcludeApp ID="Groove" />
       <ExcludeApp ID="Lync" />
