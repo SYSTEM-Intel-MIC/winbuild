@@ -430,6 +430,7 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
     New-Item -ItemType Directory -Force -Path $mnt | Out-Null
     Write-Info "离线挂载 install.wim 到 $mnt"
 
+    $mounted = $true   # 提交/卸载成功后置为 $false，finally 里据此决定是否兜底 Discard
     try {
         # 挂载
         $null = dism.exe /Mount-Wim /WimFile:$($wim.FullName) /Index:1 /MountDir:$mnt
@@ -580,38 +581,34 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
             'StateRepository', 'StateRepository', 'StateRepository', 'StateRepository'
         ) | Select-Object -Unique
 
+        # 只禁用「纯后台/遥测/社交/没人用」的服务，且只在离线 hive 里真实存在时才改。
+        # 刻意保留（改了会把系统搞坏或砍掉基础功能）：
+        #   Spooler(打印) / WinDefend、SecurityHealthService、WdNisSvc(安全中心) /
+        #   wuauserv(Windows 更新) / TrustedInstaller、AppXSvc、StateRepository、AppReadiness(装应用) /
+        #   Themes(界面主题) / MpsSvc(防火墙) / LanmanServer、LanmanWorkstation(局域网共享) /
+        #   TermService、UmRdpService(远程桌面) / Netlogon、KeyIso、EventSystem(账户/事件) /
+        #   EFS / msiserver(MSI 安装) / RasMan、RasAuto(VPN) / WSearch、SearchIndexer(搜索) /
+        #   CDPUserSvc、CDPSvc(投屏/剪贴板同步) / TabletInputService(触摸键盘) / SharedAccess(移动热点) /
+        #   LSM、RpcSs、DcomLaunch(系统核心) / BrokerInfrastructure、SystemEventsBroker(后台任务)
         $servicesToDisable = @(
-            'DiagTrack', 'dmwappushservice', 'WMPNetworkSvc', 'lfsvc', 'RetailDemo',
-            'SharedAccess', 'PhoneSvc', 'TabletInputService', 'qcamain10', 'MapsBroker',
-            'DPS', 'WbioSrvc', 'WalletService', 'Payments', 'WpcMonSvc', 'icssvc',
-            'EmbeddedMode', 'LanmanServer', 'WebClient', 'RemoteRegistry', 'TermService',
-            'AppMgmt', 'AppReadiness', 'AppXSvc', 'CDPSvc', 'CDPUserSvc', 'PcaSvc',
-            'CscService', 'DeviceAssociationService', 'DevicesAnalytics', 'EFS', 'FdPHost',
-            'Fax', 'GameBarFTServer', 'GameDVR_Svc', 'GCSvc', 'GraphicsPerfMonitor',
-            'IKEEXT', 'InvokerPRT', 'IKEEXT', 'lath', 'l2tsvc', 'lpksetup', 'LpdPrintService',
-            'Lswifi', 'ManageAccess', 'MapsBroker', 'MCoreSvc', 'MessagingSession',
-            'MF', 'MfApSvc', 'MpsSvc', 'MsMpSvc', 'MSDTC', 'msiserver', 'NcbService',
-            'Netlogon', 'Netman', 'Nsi', 'OneSyncSvc', 'Nvcontainer', 'Nvcontainer',
-            'OISClient', 'OneDrive', 'PeerDistSvc', 'PeerNetUdp', 'PerfHost', 'Phones',
-            'PhoneSvc', 'PrintNotify', 'PrintScanBrokerService', 'PushToInstall',
-            'PushNotif', 'PushNotifications', 'PTPSVC', 'qcamain', 'RasMan', 'RemoteAccess',
-            'RemoteRegistry', 'SCardSvr', 'ScPolicyGen', 'Scycjpd', 'Search', 'SearchIndexer',
-            'secmmrv', 'SecurityHealth', 'SecurityHealthService', 'SeMgrSvc', 'SensrSvc',
-            'Sftp', 'SharedAccess', 'StateRepository', 'Smb', 'Spooler', 'sppsvc',
-            'SQLAgent', 'SQLBrowser', 'SQLServer', 'SQLWriter', 'SSDP', 'sshss',
-            'SSHServer', 'TabletInputService', 'TermService', 'Themes', 'TimeBrokerSvc',
-            'tiledatamodelsvc', 'TimeBrokerSvc', 'TrkWks', 'TrustedInstaller',
-            'UmRdpService', 'upnphost', 'ups', 'UserDataSvc', 'vds', 'Verifier',
-            'WalletService', 'WarpBackup', 'wbengine', 'WbioSrvc', 'WCNSvc', 'Wcmsvc',
-            'WdiServiceHost', 'WdiSystemHost', 'WebClient', 'Wecsvc', 'WerSvc',
-            'WiaRpc', 'WinDefend', 'Windows Defender', 'WindowsDefender', 'WinHttpAutoProxySvc',
-            'WinRM', 'WMPNetworkSvc', 'WofAdkSvc', 'WPCSvc', 'WpcMonSvc', 'WSearch',
-            'WSearche', 'WSLService', 'WMPNetworkSvc', 'wuauserv', 'wuauservc',
-            'XblAuthManager', 'XblGameSave', 'XboxGipSvc', 'XboxNetApiSvc', 'XboxPcApp',
-            'XboxAccessoryManagementService', 'XboxGipSvc', 'XboxNetApiSvc', 'XnaSvc',
-            'ZDPADVSrv', 'zmi', 'zpwLoggerSvc', 'zpwLoggerSvc', 'zpwLoggerSvc',
-            'DiagTrack', 'dmwappushservice', 'lfsvc', 'SharedAccess', 'TabletInputService',
-            'MapsBroker', 'PcaSvc', 'CDPSvc', 'WMPNetworkSvc', 'WSearch', 'WerSvc'
+            # 遥测 / 诊断 / 错误报告
+            'DiagTrack', 'dmwappushservice', 'DPS', 'WerSvc', 'PcaSvc',
+            'WdiServiceHost', 'WdiSystemHost', 'Wecsvc',
+            # 位置 / 商店演示 / 家长控制 / 钱包 / 地图
+            'lfsvc', 'RetailDemo', 'WPCSvc', 'WalletService', 'MapsBroker',
+            # 媒体网络共享、WebDAV、BranchCache、P2P 传输（都不影响正常上网）
+            'WMPNetworkSvc', 'WebClient', 'PeerDistSvc', 'PeerNetUdp',
+            # 传感器 / 智能卡 / 生物识别（台式机基本用不到）
+            'SensrSvc', 'SCardSvr', 'WbioSrvc',
+            # 电话/传真/打印通知（真正的打印 Spooler 保留）
+            'PhoneSvc', 'Fax', 'PrintNotify', 'PrintScanBrokerService',
+            # Xbox / Game Bar 后台社交
+            'XblAuthManager', 'XblGameSave', 'XboxNetApiSvc', 'XboxGipSvc',
+            'XboxAccessoryManagementService', 'GameBarFTServer', 'GameDVR_Svc',
+            # 设备元数据 / 商店推送安装 / 远程注册表 / 嵌入式模式
+            'DevicesAnalytics', 'PushToInstall', 'RemoteRegistry', 'EmbeddedMode',
+            # 远程桌面 USB 重定向（TermService 保留，仍可远程桌面）
+            'UmRdpService'
         ) | Select-Object -Unique
 
         $systemHive = Join-Path $mnt 'Windows\System32\config\SYSTEM'
@@ -625,9 +622,12 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                 Write-Warning "SYSTEM hive load 失败，跳过服务优化"
             } else {
                 # 离线镜像没有 CurrentControlSet，改用 ControlSet001，直接调 reg add 避免 PS 持有句柄
+                # 注意：$hiveLabel 已含 HKLM\ 前缀，路径不能再拼一次 HKLM\
                 foreach ($svc in $servicesToDisable) {
-                    $svcKey = "HKLM\\$hiveLabel\\ControlSet001\\Services\\$svc"
+                    $svcKey = "$hiveLabel\ControlSet001\Services\$svc"
                     try {
+                        reg.exe query $svcKey 2>&1 | Out-Null
+                        if ($LASTEXITCODE -ne 0) { continue }   # 镜像里没这个服务，跳过
                         $null = reg.exe add $svcKey /v Start /t REG_DWORD /d 4 /f 2>&1
                         if ($LASTEXITCODE -eq 0) { Write-Info "已禁用服务: $svc" }
                     } catch { <# ignore #> }
@@ -636,6 +636,7 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                 Start-Sleep -Milliseconds 200
                 $null = reg.exe unload $hiveLabel 2>&1
                 Write-Info "SYSTEM hive unload 结果: $LASTEXITCODE"
+                Remove-PSDrive -Name $hivePSDrive -Force -ErrorAction SilentlyContinue
             }
         } else {
             Write-Warning "SYSTEM hive 不存在: $systemHive"
@@ -720,6 +721,19 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                     @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\WindowsAI"; Name = 'DisableClickToDo'; Value = 1; Type = 'DWord' }
                 )
 
+                # 跳过 OOBE 相关（skip_oobe 打开时才写）：
+                #   BypassNRO=1            —— OOBE 不再强制「必须联网 + 登录微软账户」，
+                #                              断网时会直接给出「我没有互联网连接 → 创建本地账户」入口；
+                #   DisablePrivacyExperience —— 直接跳过 OOBE 的隐私设置（位置/诊断/广告 ID…）整页；
+                #   EnableFirstLogonAnimation=0 —— 去掉首次登录的转圈欢迎动画，进桌面更快。
+                if ($SkipOobe) {
+                    $regPaths += @(
+                        @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\OOBE"; Name = 'BypassNRO'; Value = 1; Type = 'DWord' },
+                        @{ Path = "$hiveLabel\Policies\Microsoft\Windows\OOBE"; Name = 'DisablePrivacyExperience'; Value = 1; Type = 'DWord' },
+                        @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\System"; Name = 'EnableFirstLogonAnimation'; Value = 0; Type = 'DWord' }
+                    )
+                }
+
                 # 注册表优化：直接调 reg add，避免 PS 持有句柄，所有 reg add 子进程各自退出
                 foreach ($reg in $regPaths) {
                     $keyPath = $reg.Path
@@ -738,6 +752,7 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                 Start-Sleep -Milliseconds 200
                 reg.exe unload $hiveLabel 2>&1 | Out-Null
                 Write-Info "SOFTWARE hive unload 结果: $LASTEXITCODE"
+                Remove-PSDrive -Name $hivePSDrive -Force -ErrorAction SilentlyContinue
             }
         }
 
@@ -819,15 +834,24 @@ $updateStatus = {
     $status.Dispatcher.Invoke([Action]{ $status.Text = $msg })
 }
 
-# --- 1. 等待 Office setup.exe 完成（如果存在）---
+# --- 1. 等待 Office 安装完成（SetupComplete.cmd 已用 SYSTEM 权限启动，这里只等待）---
 $officeExe = 'C:\OfficeInstall\setup.exe'
 $officeConf = 'C:\OfficeInstall\configuration.xml'
+function Get-OfficeSetupRunning {
+    try {
+        return [bool](Get-CimInstance -ClassName Win32_Process -Filter "Name='setup.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ExecutablePath -and $_.ExecutablePath -like 'C:\OfficeInstall\*' })
+    } catch { return $false }
+}
 if ((Test-Path -LiteralPath $officeExe) -and (Test-Path -LiteralPath $officeConf)) {
-    & $updateStatus "正在安装 Office 365 (Word/Excel/PowerPoint)，约 5-15 分钟..."
-    $proc = Start-Process -FilePath $officeExe -ArgumentList "/configure `"$officeConf`""`" -NoNewWindow -PassThru -Wait
-    if ($proc.ExitCode -ne 0) {
-        & $updateStatus "Office 安装异常，退出码 $($proc.ExitCode)"
-        Start-Sleep -Seconds 10
+    if (-not (Get-OfficeSetupRunning)) {
+        # SetupComplete 那边没起来（或已结束），这里补一次
+        Start-Process -FilePath $officeExe -ArgumentList "/configure `"$officeConf`"" -NoNewWindow | Out-Null
+    }
+    $deadline = (Get-Date).AddMinutes(60)
+    while ((Get-OfficeSetupRunning) -and (Get-Date) -lt $deadline) {
+        & $updateStatus "正在安装 Office 365 (Word/Excel/PowerPoint)，请勿关机或断电..."
+        Start-Sleep -Seconds 15
     }
 }
 
@@ -852,80 +876,82 @@ $win.Dispatcher.Invoke([Action]{ $win.Close() })
         }
 
         if ($OfficeOffline) {
-            # 下载 ODT
-            $odtUrl = 'https://www.microsoft.com/en-us/download/details.aspx?id=49117' # 页面，实际下载链接在页面内
-            # 直接下载 setup.exe（ODT）
-            $odtSetup = Join-Path $BuildDir 'officedeploymenttool_20326-20112.exe'
-            if (-not (Test-Path -LiteralPath $odtSetup)) {
-                Write-Info "下载 Office Deployment Tool..."
-                # ODT 直链（Microsoft 官网，版本可能变；这里写最新版）
-                $odtDirect = 'https://download.microsoft.com/download/6c1eeb25-cf8b-41d9-8d0d-cc1dbc032140/officedeploymenttool_20326-20112.exe'
-                try {
-                    Invoke-WebRequest -Uri $odtDirect -OutFile $odtSetup -TimeoutSec 120 -ErrorAction Stop
-                } catch {
-                    Write-Warning "ODT 下载失败，将尝试备用地址: $_"
-                    # 备用
-                    $odtDirect2 = 'https://download.microsoft.com/download/6c1eeb25-cf8b-41d9-8d0d-cc1dbc032140/officedeploymenttool_20326-20112.exe'
-                    try {
-                        Invoke-WebRequest -Uri $odtDirect2 -OutFile $odtSetup -TimeoutSec 120 -ErrorAction Stop
-                    } catch {
-                        Write-Warning "ODT 备用地址也失败，跳过 Office 集成: $_"
-                    }
-                }
-            }
-            if (Test-Path -LiteralPath $odtSetup) {
-                $odtDir = Join-Path $BuildDir '_odt'
-                New-Item -ItemType Directory -Force -Path $odtDir | Out-Null
-                & $odtSetup /quiet /extract:$odtDir
-                if ($LASTEXITCODE -eq 0) {
-                    # 下载 Office 离线包
-                    $officeConfig = Join-Path $odtDir 'configuration.xml'
-                    $officeConfigContent = @'
-<Configuration>
-  <Add OfficeClientEdition="64" Channel="MonthlyEnterprise" SourcePath="C:\OfficeInstall\OfficeData">
-    <Product ID="O365ProPlusRetail">
-      <Language ID="MatchOS" />
-      <ExcludeApp ID="Access" />
-      <ExcludeApp ID="Groove" />
-      <ExcludeApp ID="Lync" />
-      <ExcludeApp ID="OneDrive" />
-      <ExcludeApp ID="OneNote" />
-      <ExcludeApp ID="Outlook" />
-      <ExcludeApp ID="Publisher" />
-      <ExcludeApp ID="Teams" />
-    </Product>
-  </Add>
-  <Property Name="SharedComputerLicensing" Value="0" />
-  <Property Name="FORCEAPPSHUTDOWN" Value="TRUE" />
-  <Property Name="AUTOACTIVATE" Value="0" />
-  <Updates Enabled="TRUE" />
-  <Display Level="None" AcceptEULA="TRUE" />
-</Configuration>
-'@
-                    Set-Content -LiteralPath $officeConfig -Value $officeConfigContent -Encoding Utf8
-                    # 下载离线包（耗时，取决于网络）
-                    Write-Info "下载 Office 离线安装包..."
-                    $officeDataDir = Join-Path $mnt 'OfficeInstall\\OfficeData'
-                    New-Item -ItemType Directory -Force -Path $officeDataDir | Out-Null
-                    # 用 setup.exe /download 下载到 OfficeData
-                    & "$odtDir\\setup.exe" /download $officeConfig 2>&1 | Out-Null
-                    if ($LASTEXITCODE -eq 0) {
-                        # 把 setup.exe 和 configuration.xml 复制到镜像
-                        $officeInstallDst = Join-Path $mnt 'OfficeInstall'
-                        Copy-Item -LiteralPath "$odtDir\\setup.exe" -Destination $officeInstallDst -Force
-                        Copy-Item -LiteralPath $officeConfig -Destination $officeInstallDst -Force
-                        # 把下载好的 OfficeData 复制到镜像
-                        $downloadedData = Join-Path (Split-Path $officeConfig -Parent) 'OfficeData'
-                        if (Test-Path -LiteralPath $downloadedData) {
-                            Copy-Item -LiteralPath $downloadedData -Destination $officeInstallDst -Recurse -Force
+            # ODT + Office 离线包（约 3.5 GB）由 scripts/Download-Office.ps1 负责下载：
+            #   - 正常情况：workflow 在跑 UUP 下载/转换**之前**就把它后台启动了，与转换并行；
+            #   - 兜底：后台没跑或没跑完，就在本地补跑一次。
+            # 任何失败都只警告、跳过 Office 集成，绝不拖垮已经跑了一个多小时的镜像构建。
+            try {
+                $officeDlDir = if ($env:OFFICE_DL_DIR) { $env:OFFICE_DL_DIR }
+                               else { Join-Path (Split-Path -Parent $BuildDir) 'office_dl' }
+                $doneMarker = Join-Path $officeDlDir 'OFFICE_DL_DONE'
+                $failMarker = Join-Path $officeDlDir 'OFFICE_DL_FAIL'
+                $officeSrc = $null
+
+                if (Test-Path -LiteralPath $officeDlDir) {
+                    Write-Info "等待 Office 离线包（并行任务目录：$officeDlDir）..."
+                    # 后台任务还在跑就一直等；进程没了又没标记（被杀/没启动）就别傻等，60 秒后走兜底
+                    $deadline = (Get-Date).AddMinutes(120)
+                    $graceEnd = (Get-Date).AddSeconds(60)
+                    while (-not (Test-Path -LiteralPath $doneMarker) -and
+                           -not (Test-Path -LiteralPath $failMarker) -and
+                           (Get-Date) -lt $deadline) {
+                        if ((Get-Date) -gt $graceEnd) {
+                            $alive = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
+                                Where-Object { $_.CommandLine -and $_.CommandLine -match 'Download-Office\.ps1' })
+                            if ($alive.Count -eq 0) {
+                                Write-Warning "Office 后台下载进程已退出但没有完成标记，转本地兜底"
+                                break
+                            }
                         }
-                        Write-Info "Office 离线包已集成到镜像"
-                    } else {
-                        Write-Warning "Office 离线包下载失败（退出码 $LASTEXITCODE）"
+                        Start-Sleep -Seconds 15
                     }
-                } else {
-                    Write-Warning "ODT 提取失败"
                 }
+
+                if (Test-Path -LiteralPath $doneMarker) {
+                    $officeSrc = $officeDlDir
+                    Write-Info "Office 离线包已就绪（并行下载）: $((Get-Content -LiteralPath $doneMarker -Raw).Trim())"
+                } else {
+                    if (Test-Path -LiteralPath $failMarker) {
+                        Write-Warning "Office 并行预下载失败: $((Get-Content -LiteralPath $failMarker -Raw).Trim())"
+                    }
+                    Write-Info "后台预下载没跑成，本地补跑 Download-Office.ps1..."
+                    $workDir = Join-Path $BuildDir '_office_work'
+                    $dlScript = Join-Path $PSScriptRoot 'Download-Office.ps1'
+                    if (Test-Path -LiteralPath $dlScript) {
+                        $psExe = (Get-Process -Id $PID).Path
+                        & $psExe -NoProfile -ExecutionPolicy Bypass -File $dlScript -WorkDir $workDir
+                        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath (Join-Path $workDir 'OFFICE_DL_DONE'))) {
+                            $officeSrc = $workDir
+                        } else {
+                            Write-Warning "Download-Office.ps1 退出码 $LASTEXITCODE"
+                        }
+                    } else {
+                        Write-Warning "找不到 $dlScript，跳过 Office 集成"
+                    }
+                }
+
+                if (-not $officeSrc) {
+                    Write-Warning "Office 离线包不可用，跳过 Office 集成（ISO 照常构建）"
+                } else {
+                    $dataSrc = Join-Path $officeSrc 'OfficeData'
+                    $setupSrc = Join-Path $officeSrc 'setup.exe'
+                    $cfgSrc = Join-Path $officeSrc 'configuration.xml'
+                    if (-not (Test-Path -LiteralPath $setupSrc)) { throw "缺少 $setupSrc" }
+                    if (-not (Test-Path -LiteralPath $cfgSrc))   { throw "缺少 $cfgSrc" }
+                    if (-not (Test-Path -LiteralPath $dataSrc))  { throw "缺少 $dataSrc" }
+
+                    $officeInstallDst = Join-Path $mnt 'OfficeInstall'
+                    New-Item -ItemType Directory -Force -Path $officeInstallDst | Out-Null
+                    Copy-Item -LiteralPath $setupSrc -Destination $officeInstallDst -Force
+                    Copy-Item -LiteralPath $cfgSrc -Destination $officeInstallDst -Force
+                    Copy-Item -LiteralPath $dataSrc -Destination $officeInstallDst -Recurse -Force
+
+                    $size = (Get-ChildItem -LiteralPath (Join-Path $officeInstallDst 'OfficeData') -Recurse -File |
+                        Measure-Object -Property Length -Sum).Sum
+                    Write-Info "Office 离线包已集成到镜像（$([math]::Round($size / 1MB, 1)) MB）"
+                }
+            } catch {
+                Write-Warning "Office 集成失败，跳过（不影响 ISO 构建）: $_"
             }
         }
 
@@ -943,15 +969,42 @@ $win.Dispatcher.Invoke([Action]{ $win.Close() })
         }
 
         # ---- 7. 卸载并提交 ----
+        # 提交曾因挂载句柄未释放报 Error 32（文件被占用）；注册表 hive 现在都已正常 unload，
+        # 这里再加：提交前强制 GC + 失败重试，最后兜底用文档化的 /Unmount-Wim /Commit。
         Write-Info "开始提交 DISM 镜像..."
-        dism.exe /Commit-Image /MountDir:$mnt 2>&1 | ForEach-Object { Write-Host $_ }
-        if ($LASTEXITCODE -ne 0) { throw "dism /Commit-Image 失败，退出码 $LASTEXITCODE" }
+        [System.GC]::Collect()
+        Start-Sleep -Seconds 3
+        $mounted = $true
+        $commitOk = $false
+        for ($i = 1; $i -le 3 -and -not $commitOk; $i++) {
+            dism.exe /Unmount-Wim /MountDir:$mnt /Commit 2>&1 | ForEach-Object { Write-Host $_ }
+            if ($LASTEXITCODE -eq 0) { $commitOk = $true; $mounted = $false }
+            else {
+                Write-Warning "dism /Unmount-Wim /Commit 第 $i 次失败（退出码 $LASTEXITCODE）"
+                if ($i -lt 3) { Start-Sleep -Seconds 20 }
+            }
+        }
+        if (-not $commitOk) {
+            # 兜底：/Commit-Image 保存改动（镜像保持挂载），再显式卸载
+            dism.exe /Commit-Image /MountDir:$mnt 2>&1 | ForEach-Object { Write-Host $_ }
+            if ($LASTEXITCODE -eq 0) {
+                $commitOk = $true
+                dism.exe /Unmount-Wim /MountDir:$mnt /Discard 2>&1 | Out-Null
+                if ($LASTEXITCODE -eq 0) { $mounted = $false }
+            }
+        }
+        if (-not $commitOk) { throw "dism 提交镜像失败（3 次 /Commit-Image 重试均未成功）" }
         Write-Info "离线精简/集成完成"
     } catch {
         # 出错时尝试放弃挂载
         dism.exe /Unmount-Wim /MountDir:$mnt /Discard 2>&1 | Out-Null
+        $mounted = $false
         throw "离线定制失败: $_"
     } finally {
+        if ($mounted) {
+            # 兜底：万一还挂着，先丢弃，避免挂载点残留导致后面封盘时文件被占用
+            dism.exe /Unmount-Wim /MountDir:$mnt /Discard 2>&1 | Out-Null
+        }
         if (Test-Path -LiteralPath $mnt) { Remove-Item -LiteralPath $mnt -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
