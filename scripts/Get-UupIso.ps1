@@ -43,7 +43,8 @@ param(
     # 不集成最新累积更新（默认集成）
     [switch] $NoUpdates,
 
-    # ESD 固体压缩（镜像更小，转换更慢）
+    # 重新封盘前把 install.wim 重打包成 install.esd（LZMS solid，约省 1.3~1.8 GB；
+    # 精简/Office/MAS/OEM logo 仍在 wim 上做完才转，所以这些功能一个都不会失效）
     [switch] $Esd,
 
     # 预装 .NET Framework 3.5
@@ -61,7 +62,7 @@ param(
     # 注入仓库 Drivers/ 目录下的驱动（AddDrivers）
     [switch] $Drivers,
 
-    # install.wim 拆分成 install.swm（wim2swm，esd 开启时无效）
+    # install.wim 拆分成 install.swm（wim2swm；开了它就找不到 install.wim，深度精简/Office/MAS/logo 都会跳过）
     [switch] $Wim2Swm,
 
     # ---- 无人值守：往 ISO 根目录注入 autounattend.xml 并重新封盘 ----
@@ -1096,7 +1097,7 @@ function Invoke-IsoReseal([System.IO.FileInfo] $Iso, [string] $Xml) {
         $wimFile = Get-ChildItem -LiteralPath (Join-Path $tree 'sources') -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -ieq 'install.wim' } | Select-Object -First 1
         if (-not $wimFile) {
-            Write-Warning "没有 install.wim（esd/wim2swm 模式不支持在线塞 logo），OEM logo 文件不会被注入"
+            Write-Warning "没有 install.wim（wim2swm 模式只产 .swm），OEM logo 文件不会被注入"
         } else {
             $wimlib = Join-Path $buildDirectory 'bin\wimlib-imagex.exe'
             if (-not (Test-Path -LiteralPath $wimlib)) {
@@ -1126,6 +1127,50 @@ function Invoke-IsoReseal([System.IO.FileInfo] $Iso, [string] $Xml) {
     } catch {
         Write-Warning "OEM logo 注入失败（不影响 ISO，只是 Logo 显示不出来）: $_"
     }
+    }
+
+    # ---- ESD 重打包：精简/Office/MAS/OEM logo 全做完了，最后才把 install.wim 用
+    #      LZMS solid 重导出成 install.esd（DISM /Compress:recovery），约省 1.3~1.8 GB。
+    #      放在最后是因为：esd 没法挂载定制，也没有工具能往里塞文件，只有 wim 能干活。----
+    if ($Esd) {
+        $sourcesDir = Join-Path $tree 'sources'
+        $wimInTree = Get-ChildItem -LiteralPath $sourcesDir -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ieq 'install.wim' } | Select-Object -First 1
+        if (-not $wimInTree) {
+            Write-Warning 'sources 下没有 install.wim（wim2swm？），跳过 ESD 重打包，按原样封盘'
+        } else {
+            $esdPath = Join-Path $sourcesDir 'install.esd'
+            if (Test-Path -LiteralPath $esdPath) { Remove-Item -LiteralPath $esdPath -Force -ErrorAction SilentlyContinue }
+            $wimPath = $wimInTree.FullName
+            $imgCount = @(Get-WindowsImage -ImagePath $wimPath).Count
+            Write-Info "ESD 重打包：install.wim 的 $imgCount 个镜像 -> install.esd（LZMS solid，这步很吃 CPU，可能要十几分钟）"
+            $esdWatch = [System.Diagnostics.Stopwatch]::StartNew()
+            $esdOk = $true
+            for ($i = 1; $i -le $imgCount -and $esdOk; $i++) {
+                $dismArgs = @('/Export-Image', "/SourceImageFile:$wimPath", "/SourceIndex:$i",
+                              "/DestinationImageFile:$esdPath", '/Compress:recovery', '/CheckIntegrity')
+                # 目标文件已存在时必须显式给 DestinationIndex，否则第二个镜像导不进去
+                if ($i -gt 1) { $dismArgs += "/DestinationIndex:$i" }
+                Write-Info "  导出镜像 $i/$imgCount ..."
+                & dism.exe @dismArgs 2>&1 | ForEach-Object { Write-Host $_ }
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning "  镜像 $i 导出失败（退出码 $LASTEXITCODE）"
+                    $esdOk = $false
+                }
+            }
+            $esdWatch.Stop()
+            if ($esdOk -and (Test-Path -LiteralPath $esdPath)) {
+                $wimMB = [math]::Round($wimInTree.Length / 1MB, 1)
+                $esdMB = [math]::Round((Get-Item -LiteralPath $esdPath).Length / 1MB, 1)
+                Remove-Item -LiteralPath $wimPath -Force
+                Write-Info ("ESD 重打包完成: {0} MB -> {1} MB（省 {2} MB，耗时 {3:n0} 秒）" -f `
+                    $wimMB, $esdMB, [math]::Round($wimMB - $esdMB, 1), $esdWatch.Elapsed.TotalSeconds)
+            } else {
+                # 失败就丢掉半截 esd、保留 wim 原样封盘，绝不让压缩这步拖垮跑了一个多小时的构建
+                Remove-Item -LiteralPath $esdPath -Force -ErrorAction SilentlyContinue
+                Write-Warning 'ESD 重打包失败，保留 install.wim 原样封盘（ISO 会大 1.3~1.8 GB）'
+            }
+        }
     }
 
     # ---- 用转换器自带的 cdimage 重新封盘 ----
@@ -1172,6 +1217,11 @@ function Invoke-IsoReseal([System.IO.FileInfo] $Iso, [string] $Xml) {
     if ($LASTEXITCODE -ne 0) { throw "7z 无法列出重新封盘的 ISO（退出码 $LASTEXITCODE）" }
     if ($listing -notmatch '(?i)autounattend\.xml') { throw '重新封盘的 ISO 里没有 autounattend.xml' }
     if ($listing -notmatch '(?i)boot\.wim') { throw '重新封盘的 ISO 里没有 boot.wim' }
+    if ($Esd) {
+        if ($listing -notmatch '(?i)install\.esd') { throw '开启了 esd 但重新封盘的 ISO 里没有 install.esd' }
+    } elseif ($listing -notmatch '(?i)install\.(wim|esd|swm)') {
+        throw '重新封盘的 ISO 里没有 install.wim/esd/swm，Windows Setup 会装不了'
+    }
     Write-Info "重新封盘成功: $([math]::Round($ri.Length / 1GB, 2)) GB"
 
     # ---- 清理：先删展开目录和原 ISO，再把新 ISO 改回原名 ----
@@ -1302,16 +1352,16 @@ $text = Get-Content -LiteralPath $iniPath -Raw
 $text = Set-IniValue $text 'AutoExit' '1'          # 转换完直接退出，不等待按键
 $text = Set-IniValue $text 'Cleanup' '1'           # 组件清理
 if (-not $NoResetBase) { $text = Set-IniValue $text 'ResetBase' '1' }   # 重置组件基线，镜像更小
-if ($Esd) {
-    $text = Set-IniValue $text 'wim2esd' '1'
-    if ($virtualEdition) { $text = Set-IniValue $text 'vwim2esd' '1' }
-}
+# 注意：这里**故意不设** wim2esd/vwim2esd。UUP dump 转换阶段转 esd 收益小，而且产物一旦变成
+# install.esd，后面的深度精简 / Office 集成 / MAS / OEM logo 全都找不到 install.wim 只能跳过。
+# 改成：全程用 wim 走完所有定制，最后在重新封盘前用 DISM /Compress:recovery
+# 一次性重打包成 install.esd（见 Invoke-IsoReseal 里的「ESD 重打包」段）。
 if ($NetFx3) { $text = Set-IniValue $text 'NetFx3' '1' }                # 预装 .NET Framework 3.5
 if ($SkipApps) { $text = Set-IniValue $text 'SkipApps' '1' }            # 跳过预装 Store 应用
 if ($SkipEdge) { $text = Set-IniValue $text 'SkipEdge' '1' }            # 跳过 Edge 集成
 if ($Wim2Swm) {
     $text = Set-IniValue $text 'wim2swm' '1'                            # install.wim 拆成 .swm
-    if ($Esd) { Write-Warning 'esd 与 wim2swm 同开时转换器以 install.esd 为准，wim2swm 会失效' }
+    if ($Esd) { Write-Warning 'wim2swm 与 esd 同开：产物只有 .swm，ESD 重打包会找不到 install.wim 而跳过' }
 }
 if ($driversEnabled) { $text = Set-IniValue $text 'AddDrivers' '1' }    # 注入 Drivers/ 驱动
 if ($virtualEdition) {
