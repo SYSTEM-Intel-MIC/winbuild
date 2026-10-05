@@ -62,8 +62,22 @@ $ConfigurationTemplate = @'
 
 $doneMarker = Join-Path $WorkDir 'OFFICE_DL_DONE'
 $failMarker = Join-Path $WorkDir 'OFFICE_DL_FAIL'
-Remove-Item -LiteralPath $doneMarker, $failMarker -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+$startMarker = Join-Path $WorkDir 'OFFICE_DL_START'
+
+try {
+    if (Test-Path -LiteralPath $doneMarker) {
+        Write-Log "已有完成标记，跳过: $((Get-Content -LiteralPath $doneMarker -Raw).Trim())"
+        exit 0
+    }
+    Remove-Item -LiteralPath $doneMarker, $failMarker -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+    # 立刻写一个「已启动」标记：主脚本靠它判断任务到底跑没跑起来
+    Set-Content -LiteralPath $startMarker -Encoding Utf8 -Value (
+        "启动 {0}  PID={1}`nWorkDir={2}`nPS={3}" -f (Get-Date -Format o), $PID, $WorkDir, $PSHOME)
+} catch {
+    Write-Log "初始化 WorkDir 失败: $_"
+    exit 1
+}
 
 function Test-PeFile([string] $Path) {
     # 校验下载到的是真正的 PE（MDZ 头 = "MZ"），防止下到 HTML 错误页
@@ -130,24 +144,19 @@ try {
 
     # ---- 4. setup /download 拉离线包 ----
     $dataDir = Join-Path $WorkDir 'OfficeData'
-    $existing = @()
-    if (Test-Path -LiteralPath $dataDir) {
-        $existing = @(Get-ChildItem -Path $dataDir -Recurse -File -ErrorAction SilentlyContinue)
-    }
-    if ($existing.Count -ge 3) {
-        Write-Log "OfficeData 已存在（$($existing.Count) 个文件），跳过下载"
-    } else {
-        Write-Log '开始下载 Office 离线安装包（约 3.5 GB，视网络 5~30 分钟）...'
-        $p = Start-Process -FilePath $setupExe -ArgumentList '/download', "`"$dlConfig`"" -Wait -PassThru
-        Write-Log "setup /download 退出码 $($p.ExitCode)"
-        if ($p.ExitCode -ne 0) { throw "setup.exe /download 失败，退出码 $($p.ExitCode)" }
-    }
+    Write-Log '开始下载 Office 离线安装包（约 3.5 GB，视网络 5~30 分钟；已下过的会自动校验续传）...'
+    $p = Start-Process -FilePath $setupExe -ArgumentList '/download', "`"$dlConfig`"" -Wait -PassThru
+    Write-Log "setup /download 退出码 $($p.ExitCode)"
+    if ($p.ExitCode -ne 0) { throw "setup.exe /download 失败，退出码 $($p.ExitCode)" }
 
-    # ---- 5. 校验 ----
+    # ---- 5. 校验（不光看文件个数，还看体积，防止半截数据被当成完成）----
     if (-not (Test-Path -LiteralPath $dataDir)) { throw 'OfficeData 目录没有生成' }
     $files = @(Get-ChildItem -Path $dataDir -Recurse -File -ErrorAction SilentlyContinue)
-    if ($files.Count -lt 3) { throw "OfficeData 只有 $($files.Count) 个文件，下载不完整" }
+    if ($files.Count -eq 0) { throw 'OfficeData 目录是空的' }
     $sum = ($files | Measure-Object -Property Length -Sum).Sum
+    $max = ($files | Measure-Object -Property Length -Maximum).Maximum
+    if ($sum -lt 1500MB) { throw ("OfficeData 只有 {0} MB（< 1500 MB），下载不完整" -f [math]::Round($sum / 1MB, 1)) }
+    if ($max -lt 50MB) { throw ("OfficeData 最大文件只有 {0} MB，下载不完整" -f [math]::Round($max / 1MB, 1)) }
 
     Set-Content -LiteralPath $doneMarker -Encoding Utf8 -Value (
         "完成时间 {0}`nOfficeData: {1} MB / {2} 个文件" -f `
@@ -157,7 +166,13 @@ try {
     exit 0
 } catch {
     $msg = "$_"
-    Set-Content -LiteralPath $failMarker -Encoding Utf8 -Value $msg
     Write-Log "失败: $msg"
+    try {
+        Set-Content -LiteralPath $failMarker -Encoding Utf8 -Value $msg
+    } catch {
+        try {
+            Set-Content -LiteralPath (Join-Path $WorkDir 'OFFICE_DL_FAIL.txt') -Encoding Utf8 -Value $msg
+        } catch { }
+    }
     exit 1
 }
