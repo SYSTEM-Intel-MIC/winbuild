@@ -856,6 +856,39 @@ if ((Test-Path -LiteralPath $officeExe) -and (Test-Path -LiteralPath $officeConf
     }
 }
 
+# --- 1.5 安装完成后清理离线安装包（C:\OfficeInstall 约 3.6 GB，装完就是纯废文件）---
+$officeRoot = 'C:\OfficeInstall'
+if ((Test-Path -LiteralPath $officeRoot) -and -not (Get-OfficeSetupRunning)) {
+    # 只有确认真装上了才删：装失败时这是唯一的离线安装源，删了就永远补不回来
+    $appsOk = $true
+    foreach ($exe in @('WINWORD.EXE', 'EXCEL.EXE', 'POWERPNT.EXE')) {
+        $hit = (Test-Path -LiteralPath ("C:\Program Files\Microsoft Office\root\Office16\$exe")) -or
+               (Test-Path -LiteralPath ("C:\Program Files (x86)\Microsoft Office\root\Office16\$exe"))
+        if (-not $hit) { $appsOk = $false }
+    }
+    if ($appsOk) {
+        & $updateStatus "Office 安装完成，正在清理安装包（释放约 3.6 GB 磁盘空间）..."
+        Start-Sleep -Seconds 20   # 等 Click-To-Run 把文件句柄放干净，否则删到一半会失败
+        for ($i = 1; $i -le 3; $i++) {
+            try {
+                Remove-Item -LiteralPath $officeRoot -Recurse -Force -ErrorAction Stop
+                break
+            } catch {
+                Start-Sleep -Seconds 10
+            }
+        }
+        if (-not (Test-Path -LiteralPath $officeRoot)) {
+            & $updateStatus "✅ 已清理 Office 安装包，释放 3.6 GB"
+        } else {
+            & $updateStatus "Office 已安装（安装包清理失败，可手动删除 $officeRoot）"
+        }
+        Start-Sleep -Seconds 3
+    } else {
+        & $updateStatus "Office 未能确认安装成功，保留 $officeRoot 以便重试"
+        Start-Sleep -Seconds 3
+    }
+}
+
 # --- 2. MAS 激活 Windows + Office ---
 & $updateStatus "正在激活 Windows + Office..."
 $masExe = 'C:\MAS\MAS_AIO.cmd'
