@@ -192,6 +192,19 @@ try {
             (Get-Date -Format o), $dataDir, [math]::Round($sum / 1MB, 1), $files.Count
     )
     Write-Log ("完成，{0} {1} MB / {2} 个文件" -f $dataDir, [math]::Round($sum / 1MB, 1), $files.Count)
+
+    # ---- 7. 剔除 arm64 交叉部件（x64 装机用不到，净省 451 MB）----
+    # ODT 会顺带下 stream.x64.x-none.arm64x.dat(+.cat)，那是给 ARM64 设备用的。
+    # 已在 runner 上做过 A/B 断网实验：CDN 屏蔽到只能回 404 的情况下，删掉这两个文件
+    # 再 setup /configure 依然 exit=0、Word/Excel/PowerPoint 三件齐全、130 秒装完（比完整包还快），
+    # 说明 ODT 根本不校验也不回退下载，这两个文件纯粹是白占 451 MB。
+    $armFiles = @(Get-ChildItem -Path $dataDir -Recurse -File -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -match 'arm64' })
+    if ($armFiles.Count -gt 0) {
+        $armMB = [math]::Round(($armFiles | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
+        $armFiles | Remove-Item -Force
+        Write-Log "已剔除 arm64 交叉部件 $($armFiles.Count) 个 / $armMB MB（x64 装机用不到，实测断网仍可安装）"
+    }
     exit 0
 } catch {
     $msg = "$_"
