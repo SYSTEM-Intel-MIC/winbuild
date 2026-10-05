@@ -10,11 +10,18 @@
 
     产出（全部落在 -WorkDir 里）：
       setup.exe                    ODT 解出来的安装器
-      configuration.xml            安装用配置（SourcePath=C:\OfficeInstall\OfficeData）
+      configuration.xml            安装用配置（SourcePath=C:\OfficeInstall，不含 /Office，
+                                   ODT 自己拼 Office\Data\<版本>，见 MS 文档
+                                   "The SourcePath value shouldn't include the /Office part
+                                    or the name of the folder on which Office Data is downloaded"）
       configuration.download.xml   下载用配置（SourcePath=本目录）
-      OfficeData\*.dat|*.cab       Office 离线安装数据
+      Office\Data\<版本>\*.dat|*.cab   Office 离线安装数据（ODT 实际布局，约 3.6 GB）
       OFFICE_DL_DONE               成功标记（主脚本轮询它）
       OFFICE_DL_FAIL               失败标记 + 原因（主脚本轮询到就跳过 Office，不拖垮构建）
+
+    注意：早期文档/旧版 ODT 用的是 <SourcePath>\OfficeData\，但 16.0.20326 的 setup.exe
+    实际写的是 <SourcePath>\Office\Data\<版本>\（已在 runner 上实测验证）。脚本两种布局都认，
+    并统一归一成 Office\Data\，这样镜像内的安装配置 SourcePath=C:\OfficeInstall 永远正确。
 
     退出码：0 = 成功，1 = 失败。
 #>
@@ -135,34 +142,52 @@ try {
     Write-Log 'setup.exe 就绪'
 
     # ---- 3. 写两份 configuration.xml ----
-    # 下载用：SourcePath 指向本目录，setup /download 把数据下到这里
+    # 下载用：SourcePath 指向本目录，setup /download 会把数据写到 <SourcePath>\Office\Data\<版本>
     $dlConfig = Join-Path $WorkDir 'configuration.download.xml'
     Set-Content -LiteralPath $dlConfig -Value ($ConfigurationTemplate -replace '__SRCPATH__', $WorkDir) -Encoding Utf8
-    # 安装用：SourcePath 固定指向装好后的 C:\OfficeInstall\OfficeData，会被拷进镜像
+    # 安装用：SourcePath 指向镜像内的 C:\OfficeInstall（不含 \Office、\Office\Data，
+    # ODT 会自己拼出 C:\OfficeInstall\Office\Data\<版本>），会被拷进镜像
     $installConfig = Join-Path $WorkDir 'configuration.xml'
-    Set-Content -LiteralPath $installConfig -Value ($ConfigurationTemplate -replace '__SRCPATH__', 'C:\OfficeInstall\OfficeData') -Encoding Utf8
+    Set-Content -LiteralPath $installConfig -Value ($ConfigurationTemplate -replace '__SRCPATH__', 'C:\OfficeInstall') -Encoding Utf8
 
     # ---- 4. setup /download 拉离线包 ----
-    $dataDir = Join-Path $WorkDir 'OfficeData'
-    Write-Log '开始下载 Office 离线安装包（约 3.5 GB，视网络 5~30 分钟；已下过的会自动校验续传）...'
+    # 实测布局：<SourcePath>\Office\Data\<版本>；部分旧版本是 <SourcePath>\OfficeData\<版本>
+    $dataDir = Join-Path $WorkDir (Join-Path 'Office' 'Data')
+    $legacyDataDir = Join-Path $WorkDir 'OfficeData'
+    Write-Log '开始下载 Office 离线安装包（约 3.6 GB，视网络 5~30 分钟；已下过的会自动校验续传）...'
     $p = Start-Process -FilePath $setupExe -ArgumentList '/download', "`"$dlConfig`"" -Wait -PassThru
     Write-Log "setup /download 退出码 $($p.ExitCode)"
     if ($p.ExitCode -ne 0) { throw "setup.exe /download 失败，退出码 $($p.ExitCode)" }
 
-    # ---- 5. 校验（不光看文件个数，还看体积，防止半截数据被当成完成）----
-    if (-not (Test-Path -LiteralPath $dataDir)) { throw 'OfficeData 目录没有生成' }
+    # ---- 5. 布局归一：不管是 Office\Data 还是 OfficeData，最后都统一成 Office\Data ----
+    if (-not (Test-Path -LiteralPath $dataDir) -and (Test-Path -LiteralPath $legacyDataDir)) {
+        try {
+            $pkgRoot = Join-Path $WorkDir 'Office'
+            New-Item -ItemType Directory -Force -Path $pkgRoot | Out-Null
+            Move-Item -LiteralPath $legacyDataDir -Destination $dataDir -Force
+            Write-Log "已把旧布局 OfficeData 归一为 Office\Data"
+        } catch {
+            Write-Log "布局归一失败（沿用旧布局）: $_"
+            $dataDir = $legacyDataDir
+        }
+    }
+
+    # ---- 6. 校验（不光看文件个数，还看体积，防止半截数据被当成完成）----
+    if (-not (Test-Path -LiteralPath $dataDir)) {
+        throw "Office 数据目录没有生成（检查了 $dataDir 和 $legacyDataDir）"
+    }
     $files = @(Get-ChildItem -Path $dataDir -Recurse -File -ErrorAction SilentlyContinue)
-    if ($files.Count -eq 0) { throw 'OfficeData 目录是空的' }
+    if ($files.Count -eq 0) { throw "Office 数据目录 $dataDir 是空的" }
     $sum = ($files | Measure-Object -Property Length -Sum).Sum
     $max = ($files | Measure-Object -Property Length -Maximum).Maximum
-    if ($sum -lt 1500MB) { throw ("OfficeData 只有 {0} MB（< 1500 MB），下载不完整" -f [math]::Round($sum / 1MB, 1)) }
-    if ($max -lt 50MB) { throw ("OfficeData 最大文件只有 {0} MB，下载不完整" -f [math]::Round($max / 1MB, 1)) }
+    if ($sum -lt 1500MB) { throw ("Office 数据只有 {0} MB（< 1500 MB），下载不完整" -f [math]::Round($sum / 1MB, 1)) }
+    if ($max -lt 50MB) { throw ("Office 数据最大文件只有 {0} MB，下载不完整" -f [math]::Round($max / 1MB, 1)) }
 
     Set-Content -LiteralPath $doneMarker -Encoding Utf8 -Value (
-        "完成时间 {0}`nOfficeData: {1} MB / {2} 个文件" -f `
-            (Get-Date -Format o), [math]::Round($sum / 1MB, 1), $files.Count
+        "完成时间 {0}`n数据目录: {1}`n体积: {2} MB / {3} 个文件" -f `
+            (Get-Date -Format o), $dataDir, [math]::Round($sum / 1MB, 1), $files.Count
     )
-    Write-Log ("完成，OfficeData {0} MB / {1} 个文件" -f [math]::Round($sum / 1MB, 1), $files.Count)
+    Write-Log ("完成，{0} {1} MB / {2} 个文件" -f $dataDir, [math]::Round($sum / 1MB, 1), $files.Count)
     exit 0
 } catch {
     $msg = "$_"
