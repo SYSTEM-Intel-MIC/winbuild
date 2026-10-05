@@ -30,7 +30,7 @@ on:
           - enterprise
           - enterprise_pro
           - multi
-        default: pro
+        default: enterprise
         required: true
       updates:
         description: "集成最新累积更新（UUP dump 下载更新包）"
@@ -41,9 +41,9 @@ on:
         type: boolean
         default: true
       esd:
-        description: "ESD 固体压缩（镜像更小，转换更慢）"
+        description: "封盘前把 install.wim 重新打包成 install.esd（LZMS solid，约省 1.3~1.8 GB；精简/Office/MAS 集成仍在 wim 上做，之后才转）"
         type: boolean
-        default: false
+        default: true
       reset_base:
         description: "ResetBase 组件基线重置（镜像更小，更慢）"
         type: boolean
@@ -61,7 +61,7 @@ on:
         type: boolean
         default: false
       wim2swm:
-        description: "install.wim 拆分成 install.swm（WIM 分卷；esd 开启时无效）"
+        description: "install.wim 拆分成 install.swm（WIM 分卷；注意：产物不再是 install.wim，会连带跳过深度精简/Office/MAS 集成/OEM logo）"
         type: boolean
         default: false
 
