@@ -624,23 +624,16 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
             if ($LASTEXITCODE -ne 0) {
                 Write-Warning "SYSTEM hive load 失败，跳过服务优化"
             } else {
-                # 离线镜像没有 CurrentControlSet，改用 ControlSet001
-                $psDriveExists = Get-PSDrive $hivePSDrive -ErrorAction SilentlyContinue
-                if (-not $psDriveExists) {
-                    $null = New-PSDrive -Name $hivePSDrive -PSProvider Registry -Root "HKLM:\\$hivePSDrive" -ErrorAction SilentlyContinue
-                }
+                # 离线镜像没有 CurrentControlSet，改用 ControlSet001，直接调 reg add 避免 PS 持有句柄
                 foreach ($svc in $servicesToDisable) {
-                    $svcKey = "${hivePSDrive}:\\ControlSet001\\Services\\$svc"
-                    if (Test-Path -LiteralPath $svcKey) {
-                        try {
-                            Set-ItemProperty -LiteralPath $svcKey -Name 'Start' -Value 4 -ErrorAction Stop
-                            Write-Info "已禁用服务: $svc"
-                        } catch { <# ignore #> }
-                    }
+                    $svcKey = "HKLM\\$hiveLabel\\ControlSet001\\Services\\$svc"
+                    try {
+                        $null = reg.exe add $svcKey /v Start /t REG_DWORD /d 4 /f 2>&1
+                        if ($LASTEXITCODE -eq 0) { Write-Info "已禁用服务: $svc" }
+                    } catch { <# ignore #> }
                 }
-                $null = Remove-PSDrive -Name $hivePSDrive -ErrorAction SilentlyContinue
                 [System.GC]::Collect()
-                Start-Sleep -Milliseconds 500
+                Start-Sleep -Milliseconds 200
                 $null = reg.exe unload $hiveLabel 2>&1
                 Write-Info "SYSTEM hive unload 结果: $LASTEXITCODE"
             }
@@ -727,26 +720,22 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                     @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\WindowsAI"; Name = 'DisableClickToDo'; Value = 1; Type = 'DWord' }
                 )
 
+                # 注册表优化：直接调 reg add，避免 PS 持有句柄，所有 reg add 子进程各自退出
                 foreach ($reg in $regPaths) {
-                    $keyPath = $reg.Path -replace '^HKLM\\', ''
-                    if ($keyPath) {
-                        $psPath = $reg.Path -replace '^HKLM\\', "${hivePSDrive}:\\"
-                        if (-not (Test-Path -LiteralPath $psPath)) {
-                            New-Item -Path $psPath -Force | Out-Null
+                    $keyPath = $reg.Path
+                    try {
+                        if ($reg.Type -eq 'DWord') {
+                            $null = reg.exe add $keyPath /v $reg.Name /t REG_DWORD /d $reg.Value /f 2>&1
+                        } else {
+                            $null = reg.exe add $keyPath /v $reg.Name /t REG_SZ /d $reg.Value /f 2>&1
                         }
-                        try {
-                            if ($reg.Type -eq 'DWord') {
-                                Set-ItemProperty -LiteralPath $psPath -Name $reg.Name -Value $reg.Value -Type DWord -ErrorAction Stop
-                            } else {
-                                Set-ItemProperty -LiteralPath $psPath -Name $reg.Name -Value $reg.Value -Type String -ErrorAction Stop
-                            }
+                        if ($LASTEXITCODE -eq 0) {
                             Write-Info "已设置注册表: $($reg.Path)\\$($reg.Name) = $($reg.Value)"
-                        } catch { <# ignore #> }
-                    }
+                        }
+                    } catch { <# ignore #> }
                 }
-                $null = Remove-PSDrive -Name $hivePSDrive -ErrorAction SilentlyContinue
                 [System.GC]::Collect()
-                Start-Sleep -Milliseconds 500
+                Start-Sleep -Milliseconds 200
                 reg.exe unload $hiveLabel 2>&1 | Out-Null
                 Write-Info "SOFTWARE hive unload 结果: $LASTEXITCODE"
             }
@@ -866,17 +855,17 @@ $win.Dispatcher.Invoke([Action]{ $win.Close() })
             # 下载 ODT
             $odtUrl = 'https://www.microsoft.com/en-us/download/details.aspx?id=49117' # 页面，实际下载链接在页面内
             # 直接下载 setup.exe（ODT）
-            $odtSetup = Join-Path $BuildDir 'officedeploymenttool_16.0.20326.20112.exe'
+            $odtSetup = Join-Path $BuildDir 'officedeploymenttool_20326-20112.exe'
             if (-not (Test-Path -LiteralPath $odtSetup)) {
                 Write-Info "下载 Office Deployment Tool..."
                 # ODT 直链（Microsoft 官网，版本可能变；这里写最新版）
-                $odtDirect = 'https://download.microsoft.com/download/0/3/0/030D9F75-9D0A-4DDE-9A30-1C7B9C9D0E9F/officedeploymenttool_16.0.20326.20112.exe'
+                $odtDirect = 'https://download.microsoft.com/download/6c1eeb25-cf8b-41d9-8d0d-cc1dbc032140/officedeploymenttool_20326-20112.exe'
                 try {
                     Invoke-WebRequest -Uri $odtDirect -OutFile $odtSetup -TimeoutSec 120 -ErrorAction Stop
                 } catch {
                     Write-Warning "ODT 下载失败，将尝试备用地址: $_"
                     # 备用
-                    $odtDirect2 = 'https://download.microsoft.com/download/0/3/0/030D9F75-9D0A-4DDE-9A30-1C7B9C9D0E9F/officedeploymenttool_16.0.16026.20117.exe'
+                    $odtDirect2 = 'https://download.microsoft.com/download/6c1eeb25-cf8b-41d9-8d0d-cc1dbc032140/officedeploymenttool_20326-20112.exe'
                     try {
                         Invoke-WebRequest -Uri $odtDirect2 -OutFile $odtSetup -TimeoutSec 120 -ErrorAction Stop
                     } catch {
