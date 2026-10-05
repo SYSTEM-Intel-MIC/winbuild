@@ -887,24 +887,29 @@ $win.Dispatcher.Invoke([Action]{ $win.Close() })
                 $failMarker = Join-Path $officeDlDir 'OFFICE_DL_FAIL'
                 $officeSrc = $null
 
-                if (Test-Path -LiteralPath $officeDlDir) {
-                    Write-Info "等待 Office 离线包（并行任务目录：$officeDlDir）..."
-                    # 后台任务还在跑就一直等；进程没了又没标记（被杀/没启动）就别傻等，60 秒后走兜底
+                # 后台任务（主流程里 Start-Job 起的）：一边等一边把它的输出打进主日志
+                $job = Get-Job -Name 'OfficeOfflineDownload' -ErrorAction SilentlyContinue
+                if ($job) {
+                    Write-Info "等待 Office 离线包并行下载（JobId=$($job.Id) -> $officeDlDir）..."
                     $deadline = (Get-Date).AddMinutes(120)
-                    $graceEnd = (Get-Date).AddSeconds(60)
+                    while ($job.State -eq 'Running' -and (Get-Date) -lt $deadline) {
+                        Receive-Job -Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  [office-dl] $_" }
+                        Start-Sleep -Seconds 15
+                        $job = Get-Job -Name 'OfficeOfflineDownload' -ErrorAction SilentlyContinue
+                        if (-not $job) { break }
+                    }
+                    Receive-Job -Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  [office-dl] $_" }
+                    if ($job) {
+                        Write-Info "Office 并行下载任务状态: $($job.State)"
+                        if ($job.State -ne 'Completed') { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+                    }
+                } elseif (Test-Path -LiteralPath $officeDlDir) {
+                    # 没有后台任务但目录在（比如手动预下载过），最多再等 60 秒
+                    Write-Info "没有后台下载任务，检查已有目录 $officeDlDir"
+                    $deadline = (Get-Date).AddSeconds(60)
                     while (-not (Test-Path -LiteralPath $doneMarker) -and
                            -not (Test-Path -LiteralPath $failMarker) -and
-                           (Get-Date) -lt $deadline) {
-                        if ((Get-Date) -gt $graceEnd) {
-                            $alive = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
-                                Where-Object { $_.CommandLine -and $_.CommandLine -match 'Download-Office\.ps1' })
-                            if ($alive.Count -eq 0) {
-                                Write-Warning "Office 后台下载进程已退出但没有完成标记，转本地兜底"
-                                break
-                            }
-                        }
-                        Start-Sleep -Seconds 15
-                    }
+                           (Get-Date) -lt $deadline) { Start-Sleep -Seconds 10 }
                 }
 
                 if (Test-Path -LiteralPath $doneMarker) {
@@ -912,18 +917,25 @@ $win.Dispatcher.Invoke([Action]{ $win.Close() })
                     Write-Info "Office 离线包已就绪（并行下载）: $((Get-Content -LiteralPath $doneMarker -Raw).Trim())"
                 } else {
                     if (Test-Path -LiteralPath $failMarker) {
-                        Write-Warning "Office 并行预下载失败: $((Get-Content -LiteralPath $failMarker -Raw).Trim())"
+                        Write-Warning "Office 并行下载失败: $((Get-Content -LiteralPath $failMarker -Raw).Trim())"
                     }
-                    Write-Info "后台预下载没跑成，本地补跑 Download-Office.ps1..."
-                    $workDir = Join-Path $BuildDir '_office_work'
+                    Write-Info "并行下载没产出，本地补跑 Download-Office.ps1（复用同一目录，可续传）..."
                     $dlScript = Join-Path $PSScriptRoot 'Download-Office.ps1'
                     if (Test-Path -LiteralPath $dlScript) {
+                        New-Item -ItemType Directory -Force -Path $officeDlDir | Out-Null
+                        $logFile = Join-Path $officeDlDir 'office_fallback.log'
                         $psExe = (Get-Process -Id $PID).Path
-                        & $psExe -NoProfile -ExecutionPolicy Bypass -File $dlScript -WorkDir $workDir
-                        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath (Join-Path $workDir 'OFFICE_DL_DONE'))) {
-                            $officeSrc = $workDir
+                        # 全部输出（含 stderr）落到文件，再打回主日志，失败原因一定看得见
+                        & $psExe -NoProfile -ExecutionPolicy Bypass -File $dlScript -WorkDir $officeDlDir *> $logFile
+                        $code = $LASTEXITCODE
+                        if (Test-Path -LiteralPath $logFile) {
+                            Get-Content -LiteralPath $logFile -Tail 40 | ForEach-Object { Write-Host "  [office-dl] $_" }
+                        }
+                        if ($code -eq 0 -and (Test-Path -LiteralPath $doneMarker)) {
+                            $officeSrc = $officeDlDir
                         } else {
-                            Write-Warning "Download-Office.ps1 退出码 $LASTEXITCODE"
+                            $reason = if (Test-Path -LiteralPath $failMarker) { (Get-Content -LiteralPath $failMarker -Raw).Trim() } else { '(没有失败标记)' }
+                            Write-Warning "Download-Office.ps1 退出码 ${code}: $reason"
                         }
                     } else {
                         Write-Warning "找不到 $dlScript，跳过 Office 集成"
@@ -1340,6 +1352,26 @@ Set-Content -LiteralPath $wrapperPath -Value $wrapperLines -Encoding Ascii
 
 $rawLog = Join-Path $buildDirectory 'uup_build.log'
 Write-Info "子进程 PSModulePath 已修正（以 $(Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules') 开头，已剔除 PowerShell 7 模块路径）"
+
+# ---- Office 离线包：在最耗时的 UUP 下载/转换**之前**就起后台任务，和 Windows 下载并行 ----
+$officeDlDir = if ($env:OFFICE_DL_DIR) { $env:OFFICE_DL_DIR } else { Join-Path $Destination 'office_dl' }
+$officeJob = $null
+if ($OfficeOffline) {
+    $dlScript = Join-Path $PSScriptRoot 'Download-Office.ps1'
+    if (Test-Path -LiteralPath $dlScript) {
+        New-Item -ItemType Directory -Force -Path $officeDlDir | Out-Null
+        try {
+            # Start-Job 的子进程输出可以用 Receive-Job 收回来打进主日志，失败原因看得见
+            $officeJob = Start-Job -Name 'OfficeOfflineDownload' -FilePath $dlScript -ArgumentList $officeDlDir
+            Write-Info "Office 离线包并行下载已启动（JobId=$($officeJob.Id) -> $officeDlDir），与 UUP 下载同时进行"
+        } catch {
+            Write-Warning "启动 Office 并行下载失败（稍后会本地补跑）: $_"
+        }
+    } else {
+        Write-Warning "找不到 $dlScript，Office 将在离线集成阶段本地补跑"
+    }
+}
+
 Write-Info "开始下载 UUP 文件并构建 ISO（这一步最耗时）"
 Push-Location $buildDirectory
 $prevEap = $ErrorActionPreference
