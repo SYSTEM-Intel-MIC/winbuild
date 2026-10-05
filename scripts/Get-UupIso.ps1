@@ -436,7 +436,7 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
         if ($LASTEXITCODE -ne 0) { throw "dism /Mount-Wim 失败，退出码 $LASTEXITCODE" }
 
         # ---- 1. 移除 Provisioned Appx 包（保留核心媒体/商店/照片/相机）----
-        $keep = @('ZuneVideo', 'Music', 'MediaPlayer', 'MicrosoftEdge', 'WindowsStore', 'Windows.Photos',
+        $keep = @('ZuneVideo', 'ZuneMusic', 'Music', 'MediaPlayer', 'MicrosoftEdge', 'WindowsStore', 'Windows.Photos',
                   'WindowsCamera', 'Windows.Media.Viewer', 'Codec', 'ScreenSketch', 'SnippingTool',
                   'Notepad', 'Photos', 'Camera', 'Store', 'FeedbackHub', 'GetHelp', 'Getstarted',
                   'Paint', 'Calculator', 'Clock', 'Cortana', 'Solitaire', 'Xbox', 'Gaming',
@@ -467,13 +467,30 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                   'MicrosoftXboxIdentityProvider', 'MicrosoftXboxSpeechToTextOverlay', 'MicrosoftGameBar',
                   'MicrosoftGameBarPresenceWriter', 'MicrosoftGameConfig', 'MicrosoftGamingApp',
                   'MicrosoftGamingServices', 'MicrosoftXboxApp', 'Xbox.TCUI', 'XboxGameOverlay',
-                  'XboxGameCallableUI', 'XboxIdentityProvider', 'XboxGamingOverlay', 'XboxSpeechToTextOverlay')
+                  'XboxGameCallableUI', 'XboxIdentityProvider', 'XboxGamingOverlay', 'XboxSpeechToTextOverlay',
+                  # ---- ~~By则~~ EXTEND ----
+                  'WindowsNotepad', 'WindowsTerminal', 'Microsoft.WindowsTerminal',
+                  'Microsoft.VCLibs', 'VCLibs.140.00', 'Microsoft.NET.Native', 'NETNative.Framework', 'NETNative.Runtime',
+                  'Microsoft.DesktopAppInstaller', 'DesktopAppInstaller', 'Microsoft.UI.Xaml', 'UI.Xaml.2.7', 'UI.Xaml.2.8',
+                  'WebView', 'Microsoft.WebMediaExtensions', 'Microsoft.WebpImageExtension', 'Microsoft.VP9VideoExtensions',
+                  'Microsoft.RawImageExtension', 'Microsoft.HEIFImageExtension', 'Microsoft.AV1VideoExtension',
+                  'Microsoft.AVCEncoderVideoExtension', 'Microsoft.MPEG2VideoExtension', 'Microsoft.HEVCVideoExtension',
+                  'Microsoft.WidgetsPlatformRuntime', 'Microsoft.Widgets', 'Microsoft.PowerAutomateDesktop',
+                  'Microsoft.GamingApp', 'Microsoft.ApplicationCompatibilityEnhancements', 'Microsoft.StartExperiencesApp',
+                  'Microsoft.StorePurchaseApp', 'Microsoft.Services.Store.Engagement', 'Microsoft.ScreenSketch',
+                  'Microsoft.OutlookForWindows', 'Clipchamp', 'Microsoft.Paint', 'MicrosoftCorporationII.QuickAssist',
+                  'MicrosoftCorporationII.MicrosoftFamily', 'MicrosoftWindows.Client.WebExperience',
+                  'MicrosoftWindows.CrossDevice', 'MSTeams', 'MSTeams.Client')
 
         $allAppx = (dism.exe /Image:$mnt /Get-ProvisionedAppxPackages 2>&1) |
             Select-String 'PackageName : (.+)' | ForEach-Object { $_.Matches[0].Groups[1].Value }
         foreach ($app in $allAppx) {
             $name = $app -replace '_.*$', ''  # 取包族名前缀，去版本号
-            if ($name -in $keep) { continue }
+            $shouldKeep = $false
+            foreach ($k in $keep) {
+                if ($app -like "*$k*") { $shouldKeep = $true; break }
+            }
+            if ($shouldKeep) { continue }
             dism.exe /Image:$mnt /Remove-ProvisionedAppxPackage /PackageName:$app 2>&1 | Out-Null
             if ($LASTEXITCODE -eq 0) { Write-Info "已移除 Appx: $name" }
         }
