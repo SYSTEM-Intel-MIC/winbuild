@@ -512,6 +512,77 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
             if ($LASTEXITCODE -eq 0) { Write-Info "已移除 Capability: $cap" }
         }
 
+        # ---- 2b. 体积诊断（清理前）：看清空间都在哪，清理前后各测一次算净收益 ----
+        function Get-DirSizeMb([string] $Root) {
+            if (-not (Test-Path -LiteralPath $Root)) { return $null }
+            $s = (Get-ChildItem -LiteralPath $Root -Recurse -File -Force -ErrorAction SilentlyContinue |
+                  Measure-Object -Property Length -Sum).Sum
+            if ($null -eq $s) { return $null }
+            return [math]::Round($s / 1MB, 1)
+        }
+        $sizeTargets = @('Windows\WinSxS', 'Windows\System32\DriverStore\FileRepository',
+                         'Program Files', 'Program Files (x86)', 'Windows\servicing\Packages')
+        $sizeBefore = @{}
+        foreach ($t in $sizeTargets) {
+            $v = Get-DirSizeMb (Join-Path $mnt $t)
+            $sizeBefore[$t] = $v
+            if ($null -ne $v) { Write-Host ("    [size:清理前] {0,-44} {1,9} MB" -f $t, $v) }
+        }
+
+        # ---- 2c. 移除可选功能（只删安全清单内匹配到的，匹配不到直接跳过，零风险）----
+        # 铁律：不碰用户点名要的东西 —— 媒体播放器/MediaFoundation、编解码器、.NET 3.5、
+        # IE 模式(Edge 依赖)、搜索、远程桌面、OpenSSH、打印/PDF 全部不在下面的清单里。
+        $featuresToRemove = @(
+            'XPS',                     # XPS 查看器 + XPS 打印（PDF 打印是独立服务，不受影响）
+            'WorkFolders',             # 工作文件夹同步（企业场景，家用用不到）
+            'Fax',                     # 传真
+            'SMB1Protocol',            # 废弃且不安全的 SMB1
+            'TelnetClient', 'SimpleTCP', 'ClientForNFS',   # 明文/老式协议
+            'RasCMAK', 'LPD', 'LPRPortMonitor', 'TFTP',    # 老网络服务
+            'SNMP',                    # 网络管理协议
+            'PowerShellV2',            # PowerShell v2 旧引擎（5.1 和 7 完全不受影响）
+            'Rsat', 'DirectoryServices', 'IPAM', 'DataCenterBridging'  # 服务器类工具
+        )
+        # /English：镜像是 zh-CN，不强制英文就解析不出 Feature Name
+        $featList = @(dism.exe /Image:$mnt /Get-Features /English 2>&1 |
+            Select-String 'Feature Name : (.+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })
+        Write-Info "镜像内可选功能 $($featList.Count) 个，全部列出供核对："
+        foreach ($f in $featList) { Write-Host "    [feature] $f" }
+        foreach ($f in $featList) {
+            $hit = $false
+            foreach ($pat in $featuresToRemove) { if ($f -like "*$pat*") { $hit = $true; break } }
+            if (-not $hit) { continue }
+            # 必须 /Remove：只 /Disable 不删文件，一点空间都省不下来
+            dism.exe /Image:$mnt /Disable-Feature /FeatureName:$f /Remove /NoRestart 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { Write-Info "已移除可选功能: $f" }
+            else { Write-Host "    [feature-fail] $f (退出码 $LASTEXITCODE)" }
+        }
+
+        # ---- 2d. 离线组件清理：清掉 LCU/更新集成后残留的 superseded 旧组件 ----
+        # 这是无损的：删的都是"已被新版本替代、永远不会被用到"的旧文件，
+        # 微软官方支持在挂载镜像上做。通常能再省几百 MB。
+        Write-Info "离线组件清理 StartComponentCleanup /ResetBase（可能 10~20 分钟）..."
+        $swClean = [System.Diagnostics.Stopwatch]::StartNew()
+        dism.exe /Image:$mnt /Cleanup-Image /StartComponentCleanup /ResetBase 2>&1 |
+            ForEach-Object { Write-Host $_ }
+        $cleanCode = $LASTEXITCODE
+        $swClean.Stop()
+        if ($cleanCode -eq 0) {
+            Write-Info ("离线组件清理完成（{0} 分钟）" -f [int]$swClean.Elapsed.TotalMinutes)
+        } else {
+            Write-Warning "离线组件清理失败（退出码 $cleanCode），不影响构建，只是少省点空间"
+        }
+
+        # ---- 2e. 体积诊断（清理后）：和清理前对比算出这一步的净收益 ----
+        foreach ($t in $sizeTargets) {
+            $v = Get-DirSizeMb (Join-Path $mnt $t)
+            if ($null -ne $v -and $null -ne $sizeBefore[$t]) {
+                $delta = [math]::Round($v - $sizeBefore[$t], 1)
+                Write-Host ("    [size:清理后] {0,-44} {1,9} MB  ({2} MB)" -f $t, $v,
+                    $(if ($delta -ge 0) { "+$delta" } else { "$delta" }))
+            }
+        }
+
         # ---- 3. 禁用服务 ----
         $servicesToDisable = @(
             'DiagTrack', 'dmwappushservice', 'WMPNetworkSvc', 'lfsvc', 'RetailDemo',
