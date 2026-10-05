@@ -945,22 +945,37 @@ $win.Dispatcher.Invoke([Action]{ $win.Close() })
                 if (-not $officeSrc) {
                     Write-Warning "Office 离线包不可用，跳过 Office 集成（ISO 照常构建）"
                 } else {
-                    $dataSrc = Join-Path $officeSrc 'OfficeData'
                     $setupSrc = Join-Path $officeSrc 'setup.exe'
                     $cfgSrc = Join-Path $officeSrc 'configuration.xml'
                     if (-not (Test-Path -LiteralPath $setupSrc)) { throw "缺少 $setupSrc" }
                     if (-not (Test-Path -LiteralPath $cfgSrc))   { throw "缺少 $cfgSrc" }
-                    if (-not (Test-Path -LiteralPath $dataSrc))  { throw "缺少 $dataSrc" }
+
+                    # ODT 实际布局是 <SourcePath>\Office\Data\<版本>（SourcePath 不含 /Office）；
+                    # 兼容旧版 ODT 的 <SourcePath>\OfficeData，遇到就搬成新布局，
+                    # 这样镜像内 configuration.xml 的 SourcePath=C:\OfficeInstall 永远对得上。
+                    $pkgRoot = Join-Path $officeSrc 'Office'
+                    if (-not (Test-Path -LiteralPath (Join-Path $pkgRoot 'Data'))) {
+                        $legacy = Join-Path $officeSrc 'OfficeData'
+                        if (Test-Path -LiteralPath $legacy) {
+                            New-Item -ItemType Directory -Force -Path $pkgRoot | Out-Null
+                            Move-Item -LiteralPath $legacy -Destination (Join-Path $pkgRoot 'Data') -Force
+                            Write-Info 'Office 数据目录已从旧布局 OfficeData 归一为 Office\Data'
+                        }
+                    }
+                    if (-not (Test-Path -LiteralPath (Join-Path $pkgRoot 'Data'))) {
+                        throw "找不到 Office 数据目录（检查了 $pkgRoot\Data 和 $legacy）"
+                    }
 
                     $officeInstallDst = Join-Path $mnt 'OfficeInstall'
                     New-Item -ItemType Directory -Force -Path $officeInstallDst | Out-Null
                     Copy-Item -LiteralPath $setupSrc -Destination $officeInstallDst -Force
                     Copy-Item -LiteralPath $cfgSrc -Destination $officeInstallDst -Force
-                    Copy-Item -LiteralPath $dataSrc -Destination $officeInstallDst -Recurse -Force
+                    # 整个 Office 目录（含 Data\<版本>）搬进镜像 -> C:\OfficeInstall\Office\Data\<版本>
+                    Copy-Item -LiteralPath $pkgRoot -Destination $officeInstallDst -Recurse -Force
 
-                    $size = (Get-ChildItem -LiteralPath (Join-Path $officeInstallDst 'OfficeData') -Recurse -File |
+                    $size = (Get-ChildItem -LiteralPath (Join-Path $officeInstallDst 'Office') -Recurse -File |
                         Measure-Object -Property Length -Sum).Sum
-                    Write-Info "Office 离线包已集成到镜像（$([math]::Round($size / 1MB, 1)) MB）"
+                    Write-Info "Office 离线包已集成到镜像（C:\OfficeInstall\Office\Data，$([math]::Round($size / 1MB, 1)) MB）"
                 }
             } catch {
                 Write-Warning "Office 集成失败，跳过（不影响 ISO 构建）: $_"
