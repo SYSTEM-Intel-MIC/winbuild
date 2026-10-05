@@ -1,0 +1,102 @@
+name: Probe Office install chain
+
+run-name: "probe: Office 离线安装链路 + arm64x 能否删除"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Download, stage as C:\OfficeInstall, install offline
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download Office offline package
+        shell: pwsh
+        run: |
+          $work = 'D:\output\office_dl'
+          & ./scripts/Download-Office.ps1 -WorkDir $work
+          if ($LASTEXITCODE -ne 0) { throw "Download-Office.ps1 失败，退出码 $LASTEXITCODE" }
+          Write-Host "DONE 标记: $((Get-Content (Join-Path $work 'OFFICE_DL_DONE') -Raw).Trim())"
+
+      - name: Stage C:\OfficeInstall and install offline
+        shell: pwsh
+        run: |
+          $work = 'D:\output\office_dl'
+          $img  = 'C:\OfficeInstall'
+
+          # 1:1 复刻镜像内的结构（Get-UupIso.ps1 就是这么拷的）
+          Remove-Item -LiteralPath $img -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $img | Out-Null
+          Copy-Item -LiteralPath (Join-Path $work 'setup.exe') -Destination $img -Force
+          Copy-Item -LiteralPath (Join-Path $work 'configuration.xml') -Destination $img -Force
+          Copy-Item -LiteralPath (Join-Path $work 'Office') -Destination $img -Recurse -Force
+
+          Write-Host "`n=== 镜像内结构（将原样进 ISO）==="
+          Get-ChildItem -LiteralPath $img -Recurse -Force |
+            Where-Object { $_.PSIsContainer -or $_.Length -gt 1MB } |
+            ForEach-Object {
+              if ($_.PSIsContainer) { Write-Host "[D] $($_.FullName)" }
+              else { Write-Host "     $($_.Name)  $([math]::Round($_.Length/1MB,1)) MB" }
+            }
+
+          $total = (Get-ChildItem -LiteralPath $img -Recurse -File | Measure-Object Length -Sum).Sum
+          Write-Host "总计 $([math]::Round($total/1MB,1)) MB"
+
+          # --- 实验：删掉 arm64 交叉部件，看 x64 装机还成不成（能删就净省 472 MB）---
+          $arm = @(Get-ChildItem -LiteralPath (Join-Path $img 'Office') -Recurse -File -Force |
+                   Where-Object { $_.Name -match 'arm64' })
+          $armMB = [math]::Round(($arm | Measure-Object Length -Sum).Sum / 1MB, 1)
+          Write-Host "`n=== 实验组：删除 arm64 部件 $($arm.Count) 个 / $armMB MB ==="
+          $arm | ForEach-Object { Write-Host "  删 $($_.Name) ($([math]::Round($_.Length/1MB,1)) MB)" }
+          $arm | Remove-Item -Force
+
+          Write-Host "`n=== 跑 setup /configure（本地源 C:\OfficeInstall）==="
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          $p = Start-Process -FilePath (Join-Path $img 'setup.exe') `
+                   -ArgumentList "/configure `"$img\configuration.xml`"" -Wait -PassThru
+          $sw.Stop()
+          Write-Host "setup /configure 退出码 = $($p.ExitCode)（耗时 $([math]::Round($sw.Elapsed.TotalSeconds)) 秒）"
+
+          Write-Host "`n=== 安装结果 ==="
+          $root = 'C:\Program Files\Microsoft Office\root\Office16'
+          foreach ($exe in @('WINWORD.EXE','EXCEL.EXE','POWERPNT.EXE')) {
+            $hit = Get-ChildItem -Path 'C:\Program Files*' -Recurse -Filter $exe -ErrorAction SilentlyContinue |
+                   Select-Object -First 1
+            if ($hit) { Write-Host "  OK  $exe -> $($hit.FullName)" } else { Write-Host "  缺失 $exe" }
+          }
+
+          Write-Host "`n=== 语言（应该有 zh-cn，不应该有 en-us）==="
+          if (Test-Path $root) {
+            Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match 'zh-cn|en-us' } | ForEach-Object { Write-Host "  $($_.Name)" }
+          }
+
+          Write-Host "`n=== 是否偷偷联网下了东西（Transport 传输量 > 1 MB 即视为没做到离线）==="
+          $big = $false
+          Get-ChildItem -Path $env:TEMP -Recurse -Depth 2 -Filter '*.log' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-30) } |
+            ForEach-Object {
+              Select-String -LiteralPath $_.FullName -Pattern 'TransferredBytes\\?":\s*"?(\d{7,})' -AllMatches |
+                ForEach-Object { $_.Matches } | ForEach-Object {
+                  $bytes = [int64]$_.Groups[1].Value
+                  if ($bytes -gt 1MB) { Write-Host "  联网传输 $([math]::Round($bytes/1MB,1)) MB"; $script:big = $true }
+                }
+            }
+          if (-not $big) { Write-Host "  未发现大于 1MB 的联网下载 -> 本地源离线安装成立" }
+
+          Write-Host "`n=== C2R 日志里的错误 ==="
+          Get-ChildItem -Path $env:TEMP -Recurse -Depth 2 -Filter '*.log' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-30) -and $_.Length -gt 10KB } |
+            ForEach-Object {
+              Select-String -LiteralPath $_.FullName -Pattern 'Error |Fatal|failed' -CaseSensitive:$false |
+                Select-Object -Last 8 | ForEach-Object { Write-Host "  $($_.Line.Substring(0, [Math]::Min(220, $_.Line.Length)))" }
+            }
+
+          Write-Host "`nPROBE_RESULT arm64_removed=$armMB setup_exit=$($p.ExitCode)"
