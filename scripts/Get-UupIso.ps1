@@ -472,6 +472,8 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                   'XboxGameCallableUI', 'XboxIdentityProvider', 'XboxGamingOverlay', 'XboxSpeechToTextOverlay',
                   # ---- ~~By则~~ EXTEND ----
                   'WindowsNotepad', 'WindowsTerminal', 'Microsoft.WindowsTerminal',
+                  # ---- 运行库（用户点名保留）：WindowsAppRuntime.1.x 是大量应用的依赖，绝不能删 ----
+                  'WindowsAppRuntime', 'WindowsAppSDK', 'Microsoft.WindowsAppRuntime',
                   'Microsoft.VCLibs', 'VCLibs.140.00', 'Microsoft.NET.Native', 'NETNative.Framework', 'NETNative.Runtime',
                   'Microsoft.DesktopAppInstaller', 'DesktopAppInstaller', 'Microsoft.UI.Xaml', 'UI.Xaml.2.7', 'UI.Xaml.2.8',
                   'WebView', 'Microsoft.WebMediaExtensions', 'Microsoft.WebpImageExtension', 'Microsoft.VP9VideoExtensions',
@@ -492,9 +494,12 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
             foreach ($k in $keep) {
                 if ($app -like "*$k*") { $shouldKeep = $true; break }
             }
-            if ($shouldKeep) { continue }
+            # 全量打印判定结果：日志里能看到镜像到底 provision 了哪些包，
+            # 下次判断"这个包该不该留、占多大"时不用再靠猜。
+            if ($shouldKeep) { Write-Host "    [keep]    $app"; continue }
             dism.exe /Image:$mnt /Remove-ProvisionedAppxPackage /PackageName:$app 2>&1 | Out-Null
             if ($LASTEXITCODE -eq 0) { Write-Info "已移除 Appx: $name" }
+            else { Write-Host "    [fail]    $app (退出码 $LASTEXITCODE)" }
         }
 
         # ---- 2. 移除 Capability（AI/Copilot/Recall 等）----
