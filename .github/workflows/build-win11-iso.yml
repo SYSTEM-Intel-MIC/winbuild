@@ -33,9 +33,9 @@ on:
         default: enterprise
         required: true
       updates:
-        description: "集成最新累积更新（UUP dump 下载更新包）"
+        description: "集成最新累积更新（UUP dump 下载更新包）。默认关闭：LCU/Enablement/SSU/NetFx/SetupDU/SafeOSDU 都会让镜像涨 1~2 GB，默认不装"
         type: boolean
-        default: true
+        default: false
       netfx3:
         description: "预装 .NET Framework 3.5"
         type: boolean
@@ -83,9 +83,9 @@ on:
         type: string
         default: "SYSTEM-Intel-MIC"
       oem_provider:
-        description: "SupportProvider：「获取帮助」显示的支持提供方"
+        description: "SupportProvider：「获取帮助」按钮上显示的支持提供方名称（Win11 用它覆盖 System Manufacturer）"
         type: string
-        default: "SYSTEM-Intel-MIC"
+        default: "SYSTEM-Intel-MIC的B站个人主页"
       oem_url:
         description: "SupportURL：「获取帮助」跳转链接；缺协议头会自动补 https://"
         type: string
@@ -105,7 +105,7 @@ on:
 
       # ---- 深度精简 / Office / MAS ----
       deep_debloat:
-        description: "离线精简 install.wim：移除预装 Appx + 移除 AI/Copilot/Recall Capability + 注册表优化 + 禁用无用服务"
+        description: "离线精简 install.wim：保留白名单式移除 Appx（含 Teams/Outlook/OneDrive/Xbox/纸牌/资讯/手机连接/获取帮助）+ 模糊匹配移除 AI/Copilot/Recall 等 Capability + 移除 IIS/MSMQ/WCF 等可选功能 + 注册表优化 + 禁用无用服务 + 删更新类计划任务"
         type: boolean
         default: true
       office_offline:
@@ -113,7 +113,7 @@ on:
         type: boolean
         default: true
       mas_activate:
-        description: "首登录运行 MAS 永久激活 Windows + Office"
+        description: "首登录自动激活：SYSTEM 后台等 Office 装完 + 等联网后，无人值守跑 MAS /HWID /Ohook /S（离线时只跑 /Ohook）"
         type: boolean
         default: true
       perf_tweaks:
