@@ -344,21 +344,28 @@ function New-UnattendXml {
             $x += '    </component>'
         }
         if ($hasHw -or $blockUpdates) {
+            # ⚠ 每条命令都必须用 cmd /c 包一层并强制 `exit 0`：
+            #   windowsPE 阶段的 RunSynchronous 只要有一条返回非 0（典型是可执行文件根本
+            #   不在 WinPE 里，CreateProcess 报 0x80070002 找不到文件），Setup 就会直接中止
+            #   整个安装，报「Windows 安装遇到错误。错误代码:0x80070002 - 0x40030」。
+            #   实测坑：WinPE 里没有 sc.exe（wuauserv 服务也不存在），上一版写的
+            #   `sc config wuauserv start= disabled` 就是这么把官方安装程序搞挂的。
+            #   反正 PE 注册表是内存盘、重启就没了，命令成功与否都不影响成品，
+            #   所以这里「保证不失败」比「保证执行成功」重要得多。
+            $peWrap = { param($cmd) 'cmd /c "' + $cmd + ' & exit 0"' }
             $syncCmds = @()
             if ($hasHw) {
                 foreach ($v in @('BypassTPMCheck', 'BypassSecureBootCheck', 'BypassRAMCheck')) {
-                    $syncCmds += @{ d = $v; p = "reg add HKLM\SYSTEM\Setup\LabConfig /v $v /t REG_DWORD /d 1 /f" }
+                    $syncCmds += @{ d = $v; p = (& $peWrap "reg add HKLM\SYSTEM\Setup\LabConfig /v $v /t REG_DWORD /d 1 /f") }
                 }
             }
             if ($blockUpdates) {
-                # 装机期同样不许更新：
-                # 1) WinPE 自己的 wuauserv 关掉 → 安装程序不会去 WU 拉"安装动态更新"(Setup DU)，
-                #    既省时间又不会把更新塞回镜像（PE 注册表不进成品，只作用于安装过程）；
-                # 2) 把 AU 策略写进 PE 注册表，拦住 OOBE 阶段的检查更新。
-                $syncCmds += @{ d = 'DisableWUinPE'; p = 'sc config wuauserv start= disabled' }
-                $syncCmds += @{ d = 'NoAutoUpdate'; p = 'reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU /v NoAutoUpdate /t REG_DWORD /d 1 /f' }
-                $syncCmds += @{ d = 'AUOptions'; p = 'reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU /v AUOptions /t REG_DWORD /d 2 /f' }
-                $syncCmds += @{ d = 'AutoInstallMinorUpdates'; p = 'reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU /v AutoInstallMinorUpdates /t REG_DWORD /d 0 /f' }
+                # 装机期拦更新：只用 reg add 写 AU 策略（WinPE 一定有 reg.exe，永远返回 0）。
+                # PE 注册表不进成品，这几条只作用于安装会话本身；
+                # 真正管用的 AU/商店策略在后面离线 SOFTWARE hive 段（4. 注册表优化）里。
+                $syncCmds += @{ d = 'NoAutoUpdate'; p = (& $peWrap 'reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU /v NoAutoUpdate /t REG_DWORD /d 1 /f') }
+                $syncCmds += @{ d = 'AUOptions'; p = (& $peWrap 'reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU /v AUOptions /t REG_DWORD /d 2 /f') }
+                $syncCmds += @{ d = 'AutoInstallMinorUpdates'; p = (& $peWrap 'reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU /v AutoInstallMinorUpdates /t REG_DWORD /d 0 /f') }
             }
             $x += '    <component name="Microsoft-Windows-Setup" ' + $cp + '>'
             $x += '      <RunSynchronous>'
@@ -517,6 +524,8 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
             'BingNews', 'BingWeather',          # 微软资讯 / 天气
             'YourPhone', 'CrossDevice',         # 手机连接 / 跨设备
             'GetHelp', 'Getstarted',            # 获取帮助 / 入门
+            'WindowsBackup', 'Backup',          # Windows 备份（点名卸载）
+            'SecHealthUI',                      # Windows 安全中心（点名卸载，离线删会 [fail]，在线兜底）
             'WindowsFeedbackHub',               # 反馈中心
             'MicrosoftOfficeHub',               # Office 推广
             'StickyNotes', 'Todos',             # 便笺 / 待办
@@ -642,6 +651,8 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
             'NetFx4Extended-ASPNET45', # ASP.NET 4.5 扩展
             'SmbDirect',               # RDMA 网卡直连（家用网卡用不到）
             'InternetPrinting',        # 互联网打印（本地打印/存 PDF 不受影响）
+            'Windows-Defender',        # ⭐ Defender：定义/平台一并删（用户点名禁用安全中心）
+            'SecHealth',               # ⭐ Windows 安全中心（SecHealthUI）后端
             'Recall'                   # ⭐ AI 回溯：录屏 + 语义搜索（必须删）
         )
         # 反向白名单：即使命中上面的关键词也绝不删（用户点名 + 虚拟化/打印/搜索/安全基础）
@@ -649,7 +660,8 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
             'DirectPlay', 'LegacyComponents',  # 旧版组件：老游戏（Age3/红警）要靠它
             'MediaPlayback', 'WindowsMediaPlayer',   # 用户点名保留的媒体播放器
             'SearchEngine',            # 开始菜单搜索
-            'Windows-Defender',        # Defender 定义
+            # 注意：原先这里有一条 'Windows-Defender'（保护 Defender 定义不被删），
+            # 用户明确要求禁用/卸载安全中心，所以已移除，改为在 featuresToRemove 里删定义
             'Printing-Foundation-Features', 'PrintToPDF',  # 打印 / 另存为 PDF
             'MSRDC',                   # 远程桌面客户端
             'TIFFIFilter',             # TIFF 预览（照片看图）
@@ -705,14 +717,23 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
         # ---- 3. 禁用服务 ----
         # 只禁用「纯后台/遥测/社交/没人用」的服务，且只在离线 hive 里真实存在时才改。
         # 刻意保留（改了会把系统搞坏或砍掉基础功能）：
-        #   Spooler(打印) / WinDefend、SecurityHealthService、WdNisSvc(安全中心) /
-        #   wuauserv(Windows 更新) / TrustedInstaller、AppXSvc、StateRepository、AppReadiness(装应用) /
+        #   Spooler(打印) / wuauserv(Windows 更新) / TrustedInstaller、AppXSvc、StateRepository、AppReadiness(装应用) /
         #   Themes(界面主题) / MpsSvc(防火墙) / LanmanServer、LanmanWorkstation(局域网共享) /
         #   TermService、UmRdpService(远程桌面) / Netlogon、KeyIso、EventSystem(账户/事件) /
         #   EFS / msiserver(MSI 安装) / RasMan、RasAuto(VPN) / WSearch、SearchIndexer(搜索) /
         #   CDPUserSvc、CDPSvc(投屏/剪贴板同步) / TabletInputService(触摸键盘) / SharedAccess(移动热点) /
         #   LSM、RpcSs、DcomLaunch(系统核心) / BrokerInfrastructure、SystemEventsBroker(后台任务)
+        # 注意：WinDefend/WdNisSvc/SecurityHealthService/Sense（Windows 安全中心 + Defender）
+        # **已经不再保留** —— 用户明确要求禁用并卸载安全中心，见下面「安全中心 / Defender」组。
         $servicesToDisable = @(
+            # ---- 用户点名：禁用 Windows 安全中心 + Defender 全家 ----
+            # WinDefend               = Defender 主服务（实时防护/扫描）
+            # WdNisSvc                = 网络检测服务（NIS）
+            # SecurityHealthService   = 「Windows 安全中心」UI 的后端，托盘图标靠它
+            # Sense                   = Microsoft Defender for Endpoint（ATP）云端连接
+            # 全部 Start=4 → 安全中心页面打不开、托盘不再弹提醒，等于事实上的卸载；
+            # 真正的「卸载」（移除 SecHealthUI 应用包）在下面 4c 的在线清理里做。
+            'WinDefend', 'WdNisSvc', 'SecurityHealthService', 'Sense',
             # 遥测 / 诊断 / 错误报告
             'DiagTrack', 'dmwappushservice', 'DPS', 'WerSvc', 'PcaSvc',
             'WdiServiceHost', 'WdiSystemHost', 'Wecsvc',
@@ -804,7 +825,27 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                     @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Search"; Name = 'CortanaConsent'; Value = 0; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Search"; Name = 'SearchBoxTaskbarMode'; Value = 1; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\System"; Name = 'EnableSmartScreen'; Value = 0; Type = 'DWord' },
-                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows Defender\Real-Time Protection"; Name = 'DisableRealtimeMonitoring'; Value = 0; Type = 'DWord' },
+                    # ---- 用户点名：禁用 Windows 安全中心 / Defender（离线写策略）----
+                    # DisableRealtimeMonitoring=1 → 关掉实时防护（原先写的是 0＝保持开启，已翻转）
+                    # DisableBehaviorMonitoring=1  → 关掉行为防护
+                    # DisableOnAccessProtection=1  → 关掉"打开文件时扫描"
+                    # DisableScanOnRealtimeEnable=1→ 关掉实时扫描
+                    # DisableAntiSpyware/DisableAntiVirus=1 → 组策略级总开关（老键，Win11 仍被读）
+                    # SPYWARE_DEFENDER_FORCE... 见 DisableAntiSpyware 家族，全部 =1 表示完全交给用户
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows Defender\Real-Time Protection"; Name = 'DisableRealtimeMonitoring'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows Defender\Real-Time Protection"; Name = 'DisableBehaviorMonitoring'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows Defender\Real-Time Protection"; Name = 'DisableOnAccessProtection'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows Defender\Real-Time Protection"; Name = 'DisableScanOnRealtimeEnable'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows Defender"; Name = 'DisableAntiSpyware'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows Defender"; Name = 'DisableAntiVirus'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows Defender"; Name = 'DisableRoutinelyTakingAction'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows Defender\Signature Update"; Name = 'DisableUpdateOnStartupWithoutEngine'; Value = 1; Type = 'DWord' },
+                    # 「Windows 安全中心」通知/托盘：不再弹任何提醒
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows Defender Security Center\Systray"; Name = 'DisableNotifications'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows Defender Security Center"; Name = 'DisableUI'; Value = 1; Type = 'DWord' },
+                    # Defender 篡改保护：不关掉它，上面这些键在线会被 Defender 自己改回去
+                    @{ Path = "$hiveLabel\Microsoft\Windows Defender\Features"; Name = 'TamperProtection'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows Defender"; Name = 'DisableAntiSpyware'; Value = 1; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Microsoft\Windows\Server\ServerManager\Tasks\Startup"; Name = 'WindowsManagementInstrumentation'; Value = 0; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\System"; Name = 'EnableTaskScheduler'; Value = 1; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\Explorer"; Name = 'NoAutoplayfornon-volume devices'; Value = 1; Type = 'DWord' },
@@ -992,16 +1033,27 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                     @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"; Name = 'EnableTransparency'; Value = 0; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize"; Name = 'StartupDelayInMSec'; Value = 0; Type = 'DWord' },
                     # 位置服务（系统级关闭，设置→隐私 里可再开）
-                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location"; Name = 'Value'; Value = 'Deny'; Type = 'String' }
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location"; Name = 'Value'; Value = 'Deny'; Type = 'String' },
+                    # ---- OneDrive：新用户首次登录自动装回来的真正元凶 ----
+                    # HKLM 的 Run 键里压根没有 OneDriveSetup（离线日志「已删除注册表值」0 条
+                    # 就是证据），真正触发首次登录安装的是 **默认用户 NTUSER.DAT** 里的
+                    # HKCU Run 值 —— 每个新账户都是从 C:\Users\Default 拷出来的。
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\Run"; Name = 'OneDriveSetup'; Value = ''; Type = 'Delete' },
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\Run"; Name = 'OneDrive'; Value = ''; Type = 'Delete' }
                 )
                 foreach ($reg in $defaultReg) {
                     try {
                         if ($reg.Type -eq 'DWord') {
                             $null = reg.exe add $reg.Path /v $reg.Name /t REG_DWORD /d $reg.Value /f 2>&1
+                        } elseif ($reg.Type -eq 'Delete') {
+                            $null = reg.exe delete $reg.Path /v $reg.Name /f 2>&1
                         } else {
                             $null = reg.exe add $reg.Path /v $reg.Name /t REG_SZ /d $reg.Value /f 2>&1
                         }
-                        if ($LASTEXITCODE -eq 0) { Write-Info "已设置默认账户注册表: $($reg.Name) = $($reg.Value)" }
+                        if ($LASTEXITCODE -eq 0) {
+                            if ($reg.Type -eq 'Delete') { Write-Info "已删除默认账户注册表值: $($reg.Name)" }
+                            else { Write-Info "已设置默认账户注册表: $($reg.Name) = $($reg.Value)" }
+                        }
                     } catch { <# ignore #> }
                 }
                 [System.GC]::Collect()
@@ -1013,25 +1065,39 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
             }
         }
 
-        # ---- 5. 写入 SetupComplete.cmd + FirstBoot.ps1 ----
+        # ---- 5. 写入 SetupComplete.cmd + Cleanup.ps1 + Activate.cmd + FirstBoot.ps1 ----
         $scriptsDir = Join-Path $mnt 'Windows\Setup\Scripts'
         New-Item -ItemType Directory -Force -Path $scriptsDir | Out-Null
         $setupComplete = Join-Path $scriptsDir 'SetupComplete.cmd'
+        # 为什么改用计划任务而不是 start /B：
+        #   上一版 start /B 起的 Activate.cmd 是 SetupComplete 的子进程，用户只要在激活完成
+        #   前重启一次，进程就被杀掉，而 RunOnce 也已经消费掉了 —— 结果就是「装完系统
+        #   Win 和 Office 都没激活」。改成 schtasks /SC ONSTART /RU SYSTEM 之后：
+        #     * 首次 SetupComplete 里手动 /Run 一次；
+        #     * 用户中途重启，下次开机计划任务自己再跑一遍；
+        #     * Office 没装完就由 Activate.cmd 重新拉起 setup.exe 续装；
+        #     * 全部成功后写 ACTIVATION_RESULT.txt 并自我删除任务，不留常驻。
+        # Cleanup.ps1 同理：入门 / Windows 备份 / OneDrive / Windows 安全中心这四个东西
+        #   离线 provisioned 列表里根本不存在（日志 grep=0），只能装完系统在线删。
         $setupCompleteContent = @'
 @echo off
-REM ===== SYSTEM-Intel-MIC SetupComplete（SYSTEM 身份、首次登录前执行）=====
-REM 1) 后台启动 Office 离线安装
-REM 2) 后台起激活器 Activate.cmd：等 Office 装完 -> 等联网 -> MAS 无人值守激活
-REM 3) 注册 RunOnce，让 FirstBoot.ps1 在用户第一次进桌面时弹窗显示进度
-
-if exist "C:\OfficeInstall\setup.exe" (
-    echo [SYSTEM-Intel-MIC] Starting Office offline installation...
-    start "" /MIN "C:\OfficeInstall\setup.exe" /configure "C:\OfficeInstall\configuration.xml"
-)
+REM ===== SYSTEM-Intel-MIC SetupComplete (runs as SYSTEM, right before first logon) =====
+REM 1) Register ONSTART scheduled task that runs Activate.cmd - survives a reboot.
+REM    Online cleanup (Getstarted / WindowsBackup / OneDrive / SecHealthUI) + Office
+REM    install + MAS activation are all owned by that single task.
+REM 2) Register RunOnce so FirstBoot.ps1 shows a progress window at first logon.
+REM NOTE: this file is written as ASCII on purpose (cmd.exe cannot read UTF-8), so
+REM       every comment below must stay ASCII-only.
 
 if exist "C:\FirstBoot\Activate.cmd" (
-    echo [SYSTEM-Intel-MIC] Starting background activator...
-    start "" /B cmd /c C:\FirstBoot\Activate.cmd
+    echo [SYSTEM-Intel-MIC] Registering activator scheduled task...
+    schtasks /Create /TN "SYSTEM_Intel_MIC_Activate" /TR "cmd.exe /c C:\FirstBoot\Activate.cmd" /SC ONSTART /RU SYSTEM /RL HIGHEST /F
+    if not errorlevel 1 (
+        schtasks /Run /TN "SYSTEM_Intel_MIC_Activate"
+    ) else (
+        echo [SYSTEM-Intel-MIC] schtasks failed, falling back to plain start
+        start "" /B cmd /c C:\FirstBoot\Activate.cmd
+    )
 )
 
 reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" /v SYSTEM_Intel_MIC_FirstBoot /t REG_SZ /d "powershell -NoProfile -ExecutionPolicy Bypass -File C:\FirstBoot\FirstBoot.ps1" /f
@@ -1043,6 +1109,147 @@ exit /b 0
                 $firstBootDir = Join-Path $mnt 'FirstBoot'
         New-Item -ItemType Directory -Force -Path $firstBootDir | Out-Null
 
+        # ---- Cleanup.ps1：装完系统后的在线清理（SYSTEM 身份）----
+        # 为什么非得在线做：入门 / Windows 备份 / OneDrive / Windows 安全中心这四样
+        # 在离线挂载的 provisioned 列表里 **一条都 grep 不到**（日志计数 0），
+        # 离线 /Remove-ProvisionedAppxPackage 根本无从下手；SecHealthUI 就算能匹配到，
+        # 离线删也会报 0x80073CFA（退出码 15610，日志里的唯一 [fail]）——
+        # 它是系统应用，只能在系统跑起来以后、以 SYSTEM 身份在线删。
+        $cleanupPs1 = Join-Path $firstBootDir 'Cleanup.ps1'
+        $cleanupContent = @'
+# SYSTEM-Intel-MIC 在线清理（SYSTEM 身份，由计划任务 SYSTEM_Intel_MIC_Activate 的
+# 第一步调用；幂等，跑完写 CLEANUP_DONE 标记，之后每次开机都会跳过）。
+# 目标：卸掉「入门」「Windows 备份」「OneDrive」「Windows 安全中心(Defender)」，
+#       并补删离线阶段因为 Tasks 目录还没生成而删掉的更新/遥测计划任务。
+$ErrorActionPreference = 'SilentlyContinue'
+$base = 'C:\FirstBoot'
+$doneMarker = Join-Path $base 'CLEANUP_DONE'
+$log = Join-Path $base 'cleanup.log'
+function L([string] $m) {
+    Add-Content -LiteralPath $log -Value ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m) -Encoding UTF8
+}
+L '=== online cleanup start ==='
+
+# --- 1. 先把 Defender 关掉（服务 + 篡改保护），否则 SecHealthUI 删了会被它自己装回来 ---
+foreach ($svc in @('SecurityHealthService', 'WdNisSvc', 'WinDefend', 'Sense')) {
+    try {
+        Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+        Set-Service  -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+        L "service disabled: $svc"
+    } catch { L "service fail: $svc $_" }
+}
+# 篡改保护（Tamper Protection）在线会挡住策略写入，先关
+foreach ($k in @(
+    'HKLM:\SOFTWARE\Microsoft\Windows Defender\Features',
+    'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender',
+    'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection')) {
+    try {
+        if (-not (Test-Path $k)) { New-Item $k -Force | Out-Null }
+    } catch { }
+}
+try { Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows Defender\Features' -Name 'TamperProtection' -Value 0 -Type DWord } catch { L "TamperProtection write fail: $_" }
+foreach ($n in @('DisableAntiSpyware','DisableAntiVirus')) {
+    try { Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender' -Name $n -Value 1 -Type DWord } catch { }
+}
+try { Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection' -Name 'DisableRealtimeMonitoring' -Value 1 -Type DWord } catch { }
+
+# --- 2. 卸掉点名要删的 Appx（provisioned + 已装到用户身上，两处都清）---
+$killNames = @(
+    'Getstarted',        # 入门
+    'WindowsBackup',     # Windows 备份
+    'SecHealthUI',       # Windows 安全中心（Defender UI）
+    'OneDriveSync',      # OneDrive 同步壳（若以 appx 形式存在）
+    'GetHelp', 'MSTeams', 'OutlookForWindows', 'BingNews'   # 兜底：万一商店又推回来
+)
+foreach ($p in @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue)) {
+    foreach ($n in $killNames) {
+        if ($p.DisplayName -like "*$n*") {
+            $r = Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -ErrorAction SilentlyContinue
+            if ($r -ne $null) { L "provisioned removed: $($p.DisplayName)" } else { L "provisioned fail: $($p.DisplayName)" }
+            break
+        }
+    }
+}
+foreach ($p in @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)) {
+    foreach ($n in $killNames) {
+        if ($p.Name -like "*$n*") {
+            try {
+                Remove-AppxPackage -Package $p.PackageFullName -AllUsers -ErrorAction Stop | Out-Null
+                L "appx removed (AllUsers): $($p.Name)"
+            } catch { L "appx fail: $($p.Name) -> $_" }
+            break
+        }
+    }
+}
+
+# --- 3. OneDrive：跑官方卸载器 + 清残留 + 删 Run 触发值 ---
+foreach ($setup in @("$env:windir\System32\OneDriveSetup.exe",
+                     "$env:windir\SysWOW64\OneDriveSetup.exe")) {
+    if (Test-Path -LiteralPath $setup) {
+        try {
+            Start-Process -FilePath $setup -ArgumentList '/uninstall' -WindowStyle Hidden -Wait
+            L "ran: $setup /uninstall"
+        } catch { L "onedrive uninstall fail: $setup -> $_" }
+    }
+}
+foreach ($proc in @('OneDrive', 'OneDriveStandaloneUpdater', 'OneDriveSetup')) {
+    try { Stop-Process -Name $proc -Force -ErrorAction SilentlyContinue } catch { }
+}
+foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+                 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run')) {
+    try {
+        $props = (Get-Item -Path $k -ErrorAction SilentlyContinue).GetValueNames()
+        foreach ($pn in $props) {
+            $v = (Get-ItemProperty -Path $k -Name $pn -ErrorAction SilentlyContinue).$pn
+            if ("$v" -like '*OneDrive*') {
+                Remove-ItemProperty -Path $k -Name $pn -Force -ErrorAction SilentlyContinue
+                L "removed Run value: $k\$pn"
+            }
+        }
+    } catch { L "Run sweep fail: $k $_" }
+}
+foreach ($odDir in @(($(Get-ChildItem -Path 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+                         ForEach-Object { Join-Path $_.FullName 'AppData\Local\Microsoft OneDrive' })),
+                     "$env:LOCALAPPDATA\Microsoft OneDrive",
+                     "$env:LOCALAPPDATA\OneDrive",
+                     'C:\Program Files\Microsoft OneDrive',
+                     'C:\Program Files (x86)\Microsoft OneDrive',
+                     'C:\OneDriveTemp')) {
+    if ($odDir -and (Test-Path -LiteralPath $odDir)) {
+        & takeown.exe /F $odDir /R /D Y 2>&1 | Out-Null
+        & icacls.exe $odDir /grant '*S-1-5-32-545:(OI)(CI)F' /T /C 2>&1 | Out-Null
+        try { Remove-Item -LiteralPath $odDir -Recurse -Force -ErrorAction Stop; L "removed dir: $odDir" }
+        catch { L "dir remove fail: $odDir -> $_" }
+    }
+}
+
+# --- 4. 补删更新/遥测计划任务（离线时 Tasks 目录还没生成，4c 那步一条都没删到）---
+$tns = @(
+    '\Microsoft\Windows\WindowsUpdate\Scheduled Start',
+    '\Microsoft\Windows\WindowsUpdate\Orchestrator\USO_UxBroker',
+    '\Microsoft\Windows\WindowsUpdate\Orchestrator\UpdateOrchestrator',
+    '\Microsoft\Windows\WindowsUpdate\Automatic App Update',
+    '\Microsoft\Windows\Automatic App Update',
+    '\Microsoft\Windows\Maps\MapsToastTask',
+    '\Microsoft\Windows\Maps\MapsUpdateTask',
+    '\Microsoft\Windows\Customer Experience Improvement Program\Consolidator',
+    '\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip',
+    '\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser',
+    '\Microsoft\Windows\Application Experience\ProgramDataUpdater',
+    '\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector'
+)
+foreach ($t in $tns) {
+    $out = & schtasks.exe /Delete /TN $t /F 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) { L "task deleted: $t" }
+}
+
+# --- 5. 收尾：写完成标记（Activate.cmd 只在没有这个标记时才会重跑本脚本）---
+L '=== online cleanup finished ==='
+Set-Content -LiteralPath $doneMarker -Value (Get-Date -Format s) -Encoding Ascii
+'@
+        # UTF8BOM：由 Windows PowerShell 5.1 执行，无 BOM 的 UTF-8 会被当成 ANSI 解码
+        Set-Content -LiteralPath $cleanupPs1 -Value $cleanupContent -Encoding UTF8BOM
+
         # ---- Activate.cmd：SYSTEM 后台跑的激活器 ----
         # 为什么不在 FirstBoot.ps1 里直接跑 MAS：
         #   * FirstBoot.ps1 是普通用户会话，跑 HWID 要弹 UAC、还可能没权限；
@@ -1051,31 +1258,64 @@ exit /b 0
         # 所以交给 SetupComplete 起的 SYSTEM 后台进程，按顺序等两件事再跑 MAS，
         # 结果写成标记文件，前台的 FirstBoot.ps1 只负责显示。
         $activateCmd = Join-Path $firstBootDir 'Activate.cmd'
+        # 由计划任务 SYSTEM_Intel_MIC_Activate（ONSTART / SYSTEM）拉起，
+        # 所以「用户中途重启」不再会把激活打断：下次开机会自己重跑，
+        # Office 没装完就重新拉 setup.exe 续装，全部成功后写结果标记并自我删除任务。
         $activateContent = @'
-REM ===== SYSTEM-Intel-MIC Activate (SYSTEM, launched by SetupComplete) =====
-REM Wait for Office -> wait for network -> run MAS unattended -> write result marker
+REM ===== SYSTEM-Intel-MIC Activate (SYSTEM, task SYSTEM_Intel_MIC_Activate) =====
+REM 0) already finished -> delete own task and exit
+REM 1) online cleanup (Getstarted / WindowsBackup / OneDrive / SecHealthUI) if not done yet
+REM 2) Office install - (re)launch setup.exe, survives a reboot
+REM 3) wait for network -> MAS unattended (/HWID + /Ohook) -> write result marker
 setlocal enabledelayedexpansion
 set LOG=C:\FirstBoot\activation.log
 set RES=C:\FirstBoot\ACTIVATION_RESULT.txt
 set WAITED=0
+set LAUNCHES=0
 set ONLINE=0
 set HWIDCODE=NA
 set OHOOKCODE=NA
 set WIN_LICENSE=NA
-echo [%date% %time%] activator start > "%LOG%"
+set OFFICE=SKIP
 
-REM --- 1) Wait until FirstBoot writes OFFICE_DONE (it installs Office), max 90 min ---
-:waitoffice
-if exist "C:\FirstBoot\OFFICE_DONE" goto officedone
+if exist "%RES%" goto selfdelete
+echo [%date% %time%] activator start >> "%LOG%"
+
+REM --- 1) online cleanup (idempotent; skipped once CLEANUP_DONE exists) ---
+if not exist "C:\FirstBoot\CLEANUP_DONE" (
+    if exist "C:\FirstBoot\Cleanup.ps1" (
+        echo [%date% %time%] running online cleanup >> "%LOG%"
+        powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File "C:\FirstBoot\Cleanup.ps1" >> "%LOG%" 2>&1
+    )
+)
+
+REM --- 2) Office install: check install state first, launch setup when idle ---
+:office
+if exist "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE" goto officeok
+if exist "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE" goto officeok
+if not exist "C:\OfficeInstall\setup.exe" goto officedone
+tasklist /FI "IMAGENAME eq setup.exe" 2>nul | find /I "setup.exe" >nul
+if not errorlevel 1 goto officewait
+set /a LAUNCHES+=1
+if !LAUNCHES! gtr 5 goto officedone
+echo [%date% %time%] starting Office setup, try !LAUNCHES! >> "%LOG%"
+start "" /MIN "C:\OfficeInstall\setup.exe" /configure "C:\OfficeInstall\configuration.xml"
+ping -n 6 127.0.0.1 >nul
+:officewait
 set /a WAITED+=1
-if %WAITED% gtr 360 goto officedone
+if %WAITED% gtr 360 goto officetimeout
 ping -n 16 127.0.0.1 >nul
-goto waitoffice
+goto office
+:officeok
+set OFFICE=OK
+echo [%date% %time%] Office installed >> "%LOG%"
+goto officedone
+:officetimeout
+echo [%date% %time%] Office install timed out after 90 min >> "%LOG%"
 :officedone
-echo [%date% %time%] office marker: >> "%LOG%"
-if exist "C:\FirstBoot\OFFICE_DONE" type "C:\FirstBoot\OFFICE_DONE" >> "%LOG%"
+if not exist "C:\FirstBoot\OFFICE_DONE" echo %OFFICE% %date% %time% > "C:\FirstBoot\OFFICE_DONE"
 
-REM --- 2) Wait for network (26100+ HWID/TSforge needs it), max 30 min ---
+REM --- 3) wait for network (26100+ HWID/TSforge needs it), max 30 min ---
 set WAITED=0
 :waitnet
 ping -n 1 -w 2000 223.5.5.5 >nul 2>&1
@@ -1094,7 +1334,7 @@ goto dorun
 echo [%date% %time%] no network after 30 min, Office offline activation only >> "%LOG%"
 
 :dorun
-REM --- 3) MAS unattended: any switch selects unattended mode (no menu, no keypress). ---
+REM --- 4) MAS unattended: any switch selects unattended mode (no menu, no keypress). ---
 REM     HWID and Ohook run as TWO separate calls so neither one gets skipped:
 REM       /HWID  = Windows digital license (needs network)
 REM       /Ohook = Office permanent activation (works offline)
@@ -1104,25 +1344,38 @@ call "C:\MAS\MAS_AIO.cmd" /Ohook /S >> "%LOG%" 2>&1
 set OHOOKCODE=!errorlevel!
 echo [%date% %time%] MAS exit: HWID=!HWIDCODE! OHOOK=!OHOOKCODE! >> "%LOG%"
 
-REM --- 4) Double check the real Windows license state via WMI (no GUI, no popup) ---
+REM --- 5) Double check the real Windows license state via WMI (no GUI, no popup) ---
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance SoftwareLicensingProduct -Filter 'PartialProductKey IS NOT NULL AND LicenseStatus = 1' -ErrorAction SilentlyContinue | Select-Object -First 1; if ($p) { '1' } else { '0' }" > "%TEMP%\wl.txt" 2>&1
 findstr /r /x /c:"1" "%TEMP%\wl.txt" >nul 2>&1
 if not errorlevel 1 set WIN_LICENSE=1
 findstr /r /x /c:"0" "%TEMP%\wl.txt" >nul 2>&1
 if not errorlevel 1 set WIN_LICENSE=0
 
-REM --- 5) Result marker read by FirstBoot.ps1 ---
+REM --- 6) prune the ~3.6 GB offline Office source, but only when Office really landed ---
+if not "%OFFICE%" == "OK" goto reswrite
+if not exist "C:\OfficeInstall\setup.exe" goto reswrite
+ping -n 21 127.0.0.1 >nul
+rmdir /s /q "C:\OfficeInstall" >> "%LOG%" 2>&1
+if exist "C:\OfficeInstall" echo [%date% %time%] OfficeInstall prune failed >> "%LOG%"
+if not exist "C:\OfficeInstall" echo [%date% %time%] OfficeInstall pruned, freed 3.6 GB >> "%LOG%"
+
+:reswrite
+REM --- 7) Result marker read by FirstBoot.ps1 ---
 if %ONLINE% equ 1 goto resonline
 echo NETWORK=OFFLINE> "%RES%"
 goto resdone
 :resonline
 echo NETWORK=OK> "%RES%"
 :resdone
+echo OFFICE=%OFFICE%>> "%RES%"
 echo HWID_EXIT=!HWIDCODE!>> "%RES%"
 echo OHOOK_EXIT=!OHOOKCODE!>> "%RES%"
 echo WIN_LICENSE=!WIN_LICENSE!>> "%RES%"
 echo DONE>> "%RES%"
 echo [%date% %time%] activator finished, WIN_LICENSE=!WIN_LICENSE! >> "%LOG%"
+
+:selfdelete
+schtasks /Delete /TN "SYSTEM_Intel_MIC_Activate" /F >nul 2>&1
 endlocal
 exit /b 0
 
@@ -1132,27 +1385,108 @@ exit /b 0
 
         $firstBootPs1 = Join-Path $firstBootDir 'FirstBoot.ps1'
         $firstBootContent = @'
-# SYSTEM-Intel-MIC FirstBoot Orchestrator（普通用户会话，RunOnce 触发）
-# 只做三件事：
-#   1) 显示"正在安装 Office / 正在激活"的进度窗口；
-#   2) 等 Office 装完（需要时补拉一次 setup.exe）；
-#   3) 读后台激活器写的结果标记，把"激活成功/失败"显示出来。
-# 真正跑 MAS 的是 SetupComplete 起的 SYSTEM 后台进程 Activate.cmd ——
-# 这里**不碰** MAS，避免普通用户权限不足、没联网、Office 还没装完这三种坑。
-
+# SYSTEM-Intel-MIC FirstBoot 进度窗（普通用户会话，RunOnce 触发）
+#
+# 职责**只有显示**：Office 安装 / 在线清理 / MAS 激活全部由 SYSTEM 身份的
+# 计划任务 SYSTEM_Intel_MIC_Activate 跑，这里只是读它们写的标记文件。
+#
+# 为什么重写（上一版会把人卡死）：
+#   上一版 $win.Show() 之后在**同一个 UI 线程**上 while + Start-Sleep ——
+#   WPF 的消息泵根本没转，窗口画不出来也不响应鼠标，看起来就是「弹个欢迎窗口
+#   然后死机，只能重启」。现在改成：
+#     * 所有等待都放在后台 runspace 里跑，UI 线程只负责 ShowDialog 泵消息；
+#     * UI 线程上挂一个 DispatcherTimer，每 500 ms 从共享状态读一次文本刷新；
+#     * 用户随时可以点右上角 X 关掉窗口，后台激活完全不受影响。
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-# --- RunOnce 自删除（只执行一次）---
+# --- RunOnce 自删除（该值由 explorer 启动本脚本后本就会清掉，这里兜底）---
 reg delete "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" /v SYSTEM_Intel_MIC_FirstBoot /f 2>&1 | Out-Null
+reg delete "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" /v SYSTEM_Intel_MIC_FirstBoot /f 2>&1 | Out-Null
 
-# --- 顶级置顶窗口（始终在最前，可手动关闭）---
+# --- 与后台 runspace 共享的状态（Synchronized 保证跨线程可见）---
+$state = [hashtable]::Synchronized(@{
+    Status = '正在初始化，请稍候...'
+    Info   = $null
+    Done   = $false
+})
+
+# ================= 后台 runspace：等待 SYSTEM 后台任务的产出 =================
+$runspace = [powershell]::Create()
+$null = $runspace.AddScript({
+    param($st)
+    $resultFile = 'C:\FirstBoot\ACTIVATION_RESULT.txt'
+    $logFile    = 'C:\FirstBoot\activation.log'
+
+    function Get-ResValue([object[]] $Lines, [string] $Key) {
+        $hit = $Lines | Where-Object { $_ -like "$Key=*" } | Select-Object -First 1
+        if ($hit) { return ($hit -replace [regex]::Escape("$Key="), '') }
+        return $null
+    }
+
+    # 1) 等 Office 装完（标记由 SYSTEM 的 Activate.cmd 写）
+    $deadline = (Get-Date).AddMinutes(90)
+    while (-not (Test-Path -LiteralPath 'C:\FirstBoot\OFFICE_DONE') -and (Get-Date) -lt $deadline) {
+        $st.Status = '正在安装 Office 365 (Word/Excel/PowerPoint)，请勿关机或断电...'
+        Start-Sleep -Seconds 3
+    }
+    if (Test-Path -LiteralPath 'C:\FirstBoot\OFFICE_DONE') {
+        $st.Status = 'Office 安装完成，正在联网激活 Windows + Office...'
+    } else {
+        $st.Status = '正在激活 Windows + Office（等待联网并运行 MAS，无需操作）...'
+    }
+
+    # 2) 等激活结果（最多 60 分钟）
+    $deadline = (Get-Date).AddMinutes(60)
+    while (-not (Test-Path -LiteralPath $resultFile) -and (Get-Date) -lt $deadline) {
+        $st.Status = '正在激活 Windows + Office（等待联网并运行 MAS，无需操作）...'
+        Start-Sleep -Seconds 5
+    }
+
+    # 3) 生成给用户看的结论
+    $tail = ''
+    if (Test-Path -LiteralPath $logFile) {
+        $tail = ((Get-Content -LiteralPath $logFile -Tail 8 -ErrorAction SilentlyContinue) -join "`r`n")
+    }
+    if (Test-Path -LiteralPath $resultFile) {
+        $raw  = @(Get-Content -LiteralPath $resultFile -ErrorAction SilentlyContinue)
+        $net  = Get-ResValue $raw 'NETWORK'
+        $hwid = Get-ResValue $raw 'HWID_EXIT'
+        $ohk  = Get-ResValue $raw 'OHOOK_EXIT'
+        $lic  = Get-ResValue $raw 'WIN_LICENSE'
+        $off  = Get-ResValue $raw 'OFFICE'
+        # Windows 以真实授权状态为准（WIN_LICENSE=1 才算已授权）
+        $winOk = if ($lic -eq '1') { $true } elseif ($lic -eq '0') { $false } else { ($hwid -eq '0') }
+        $offOk = if ($off -eq 'OK') { $true } elseif ($off -eq 'SKIP') { $false } else { ($ohk -eq '0') }
+        $netTxt = if ($net -eq 'OFFLINE') {
+            '离线：仅跑了 Office 离线激活，联网后可再双击运行 C:\MAS\MAS_AIO.cmd 激活 Windows'
+        } else { '已联网' }
+        if ($winOk -and $offOk) {
+            $st.Status = "✅ 激活完成（$netTxt）"
+            $st.Info = "Windows 已激活，Office (Word/Excel/PowerPoint) 已激活。"
+        } else {
+            $parts = @()
+            if ($winOk) { $parts += 'Windows ✅ 已激活' } else { $parts += "Windows ⚠ 返回码 $hwid（WIN_LICENSE=$lic）" }
+            if ($offOk) { $parts += 'Office ✅ 已激活' } else { $parts += "Office ⚠ 返回码 $ohk（OFFICE=$off）" }
+            $st.Status = "⚠ 激活部分完成（$netTxt）"
+            $st.Info = ($parts -join "`r`n") + "`r`n可手动双击运行 C:\MAS\MAS_AIO.cmd 重试。"
+        }
+    } else {
+        $st.Status = '⚠ 未等到激活结果（联网较慢或激活器还没跑完）'
+        $st.Info   = "后台计划任务 SYSTEM_Intel_MIC_Activate 会在下次开机继续跑。`r`n也可手动双击运行 C:\MAS\MAS_AIO.cmd 重试。"
+    }
+    if ($tail) { $st.Info = "$($st.Info)`r`n`r`n激活日志尾部：`r`n$tail" }
+    $st.Done = $true
+}).AddArgument($state)
+$null = $runspace.BeginInvoke()
+
+# ================= UI：窗口 + DispatcherTimer 泵消息 =================
 $win = New-Object System.Windows.Window
 $win.Title = "SYSTEM-Intel-MIC 优化版 Windows 11"
-$win.Width = 540; $win.Height = 380
+$win.Width = 560; $win.Height = 400
 $win.WindowStartupLocation = 'CenterScreen'
 $win.Topmost = $true
 $win.ResizeMode = 'NoResize'
-$win.ShowInTaskbar = $false
+$win.ShowInTaskbar = $true
 $win.Background = [System.Windows.Media.Brushes]::White
 
 $stack = New-Object System.Windows.Controls.StackPanel
@@ -1167,136 +1501,50 @@ $title.Margin = '0,0,0,10'
 $stack.Children.Add($title)
 
 $status = New-Object System.Windows.Controls.TextBlock
-$status.Text = "正在初始化，请稍候..."
+$status.Text = $state.Status
 $status.TextWrapping = 'Wrap'
 $status.FontSize = 14
 $status.Margin = '0,0,0,8'
 $stack.Children.Add($status)
 
+$staticInfo = "• 由 SYSTEM-Intel-MIC 构建`r`n• 已移除：AI/Copilot/Recall/Teams/Outlook/OneDrive/Xbox/纸牌/资讯/手机连接/获取帮助/入门/Windows 备份`r`n• 已禁用：自动更新（含 OOBE）/遥测/广告/推送安装/Windows 安全中心(Defender)`r`n• 保留：记事本/PowerShell/画图/计算器/截图/闹钟/Edge/商店/照片/相机/媒体播放器`r`n• B站主页：https://space.bilibili.com/1978487514"
 $info = New-Object System.Windows.Controls.TextBlock
-$info.Text = "• 由 SYSTEM-Intel-MIC 构建`r`n• 已移除：AI/Copilot/Recall/Teams/Outlook/OneDrive/Xbox/纸牌/资讯/手机连接/获取帮助`r`n• 已禁用：自动更新（含 OOBE）/遥测/广告/推送安装`r`n• 保留：记事本/PowerShell/画图/计算器/Edge/商店/照片/相机/媒体播放器`r`n• B站主页：https://space.bilibili.com/1978487514"
+$info.Text = $staticInfo
 $info.TextWrapping = 'Wrap'
 $info.FontSize = 12
 $info.Foreground = [System.Windows.Media.Brushes]::Gray
 $stack.Children.Add($info)
 
 $win.Content = $stack
-$win.Show()
 
-$updateStatus = {
-    param($msg)
-    $status.Dispatcher.Invoke([Action]{ $status.Text = $msg })
-}
-
-# --- 1. 等待 Office 安装完成（SetupComplete 已用 SYSTEM 启动，这里只等待/补拉）---
-$officeExe = 'C:\OfficeInstall\setup.exe'
-$officeConf = 'C:\OfficeInstall\configuration.xml'
-function Get-OfficeSetupRunning {
-    try {
-        return [bool](Get-CimInstance -ClassName Win32_Process -Filter "Name='setup.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.ExecutablePath -and $_.ExecutablePath -like 'C:\OfficeInstall\*' })
-    } catch { return $false }
-}
-if ((Test-Path -LiteralPath $officeExe) -and (Test-Path -LiteralPath $officeConf)) {
-    if (-not (Get-OfficeSetupRunning)) {
-        # SetupComplete 那边没起来（或已结束），这里补一次
-        Start-Process -FilePath $officeExe -ArgumentList "/configure `"$officeConf`"" -NoNewWindow | Out-Null
+$closeTimer = $null
+$timer = New-Object System.Windows.Threading.DispatcherTimer
+$timer.Interval = [TimeSpan]::FromMilliseconds(500)
+$timer.Add_Tick({
+    # UI 线程只做一件事：把后台状态同步到控件（这就是上一版被缺掉的消息泵）
+    # 注意事件处理器里的变量一律用 $script: 前缀，否则解析不到脚本作用域的值
+    $script:status.Text = $script:state.Status
+    if ($script:state.Info) { $script:info.Text = $script:state.Info }
+    if ($script:state.Done -and -not $script:closeTimer) {
+        $script:closeTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $script:closeTimer.Interval = [TimeSpan]::FromSeconds(30)
+        $script:closeTimer.Add_Tick({
+            $script:timer.Stop()
+            $script:closeTimer.Stop()
+            $script:win.Close()
+        })
+        $script:closeTimer.Start()
     }
-    $deadline = (Get-Date).AddMinutes(60)
-    while ((Get-OfficeSetupRunning) -and (Get-Date) -lt $deadline) {
-        & $updateStatus "正在安装 Office 365 (Word/Excel/PowerPoint)，请勿关机或断电..."
-        Start-Sleep -Seconds 15
-    }
-}
+})
+$timer.Start()
 
-# --- 1.5 安装完成后清理离线安装包（C:\OfficeInstall 约 3.6 GB，装完就是纯废文件）---
-$officeRoot = 'C:\OfficeInstall'
-if ((Test-Path -LiteralPath $officeRoot) -and -not (Get-OfficeSetupRunning)) {
-    # 只有确认真装上了才删：装失败时这是唯一的离线安装源，删了就永远补不回来
-    $appsOk = $true
-    foreach ($exe in @('WINWORD.EXE', 'EXCEL.EXE', 'POWERPNT.EXE')) {
-        $hit = (Test-Path -LiteralPath ("C:\Program Files\Microsoft Office\root\Office16\$exe")) -or
-               (Test-Path -LiteralPath ("C:\Program Files (x86)\Microsoft Office\root\Office16\$exe"))
-        if (-not $hit) { $appsOk = $false }
-    }
-    if ($appsOk) {
-        & $updateStatus "Office 安装完成，正在清理安装包（释放约 3.6 GB 磁盘空间）..."
-        Start-Sleep -Seconds 20   # 等 Click-To-Run 把文件句柄放干净，否则删到一半会失败
-        for ($i = 1; $i -le 3; $i++) {
-            try {
-                Remove-Item -LiteralPath $officeRoot -Recurse -Force -ErrorAction Stop
-                break
-            } catch {
-                Start-Sleep -Seconds 10
-            }
-        }
-        if (-not (Test-Path -LiteralPath $officeRoot)) {
-            & $updateStatus "✅ 已清理 Office 安装包，释放 3.6 GB"
-        } else {
-            & $updateStatus "Office 已安装（安装包清理失败，可手动删除 $officeRoot）"
-        }
-        Start-Sleep -Seconds 3
-    } else {
-        & $updateStatus "Office 未能确认安装成功，保留 $officeRoot 以便重试"
-        Start-Sleep -Seconds 3
-    }
-}
-
-# --- 1.9 通知后台激活器：Office 这一步已经结束（装完/没装/失败都算结束）---
-# 后台 Activate.cmd 只认这个标记，避免它在那儿盲等一个根本没起来的 setup.exe。
-$officeState = if (-not (Test-Path -LiteralPath $officeRoot)) { 'SKIP' }
-               elseif (-not (Get-OfficeSetupRunning)) { 'DONE' } else { 'TIMEOUT' }
-Set-Content -LiteralPath 'C:\FirstBoot\OFFICE_DONE' -Value "$officeState $(Get-Date -Format s)" -Encoding Ascii
-
-# --- 2. 等后台激活器（Activate.cmd）写结果标记 ---
-# 它会先等 Office 装完、再等联网，然后用无人值守模式跑 MAS（/HWID /Ohook /S）。
-$resultFile = 'C:\FirstBoot\ACTIVATION_RESULT.txt'
-$deadline = (Get-Date).AddMinutes(60)
-while (-not (Test-Path -LiteralPath $resultFile) -and (Get-Date) -lt $deadline) {
-    & $updateStatus "正在激活 Windows + Office（等待联网并运行 MAS，无需操作）..."
-    Start-Sleep -Seconds 10
-}
-
-# --- 3. 显示激活结果 ---
-function Get-ResValue([object[]] $Lines, [string] $Key) {
-    $hit = $Lines | Where-Object { $_ -like "$Key=*" } | Select-Object -First 1
-    if ($hit) { return ($hit -replace [regex]::Escape("$Key="), '') }
-    return $null
-}
-$verdict = ''
-$tail = ''
-if (Test-Path -LiteralPath $resultFile) {
-    $raw = @(Get-Content -LiteralPath $resultFile -ErrorAction SilentlyContinue)
-    $net  = Get-ResValue $raw 'NETWORK'
-    $hwid = Get-ResValue $raw 'HWID_EXIT'
-    $ohk  = Get-ResValue $raw 'OHOOK_EXIT'
-    $logF = 'C:\FirstBoot\activation.log'
-    if (Test-Path -LiteralPath $logF) { $tail = ((Get-Content -LiteralPath $logF -Tail 8) -join "`r`n") }
-    # Windows 以真实授权状态为准（WIN_LICENSE=1 表示已授权），拿不到再退回退出码
-    $lic = Get-ResValue $raw 'WIN_LICENSE'
-    $winOk  = if ($lic -eq '1') { $true } elseif ($lic -eq '0') { $false } else { ($hwid -eq '0') }
-    $offOk  = ($ohk -eq '0')
-    $netTxt = if ($net -eq 'OFFLINE') { '离线：仅跑了 Office 离线激活，联网后可再点一次 C:\MAS\MAS_AIO.cmd 激活 Windows' }
-              else { '已联网' }
-    if ($winOk -and $offOk) {
-        $verdict = "✅ 激活完成（$netTxt）`r`nWindows 已激活，Office (Word/Excel/PowerPoint) 已激活。"
-    } else {
-        $parts = @()
-        if ($winOk) { $parts += 'Windows ✅ 已激活' } else { $parts += "Windows ⚠ 返回码 $hwid" }
-        if ($offOk) { $parts += 'Office ✅ 已激活' } else { $parts += "Office ⚠ 返回码 $ohk" }
-        $verdict = "⚠ 激活部分完成（$netTxt）`r`n" + ($parts -join "`r`n") + "`r`n可手动双击运行 C:\MAS\MAS_AIO.cmd 重试。"
-    }
-} else {
-    $verdict = "⚠ 未等到激活结果（可能联网较慢或激活器被占用）。`r`n可手动双击运行 C:\MAS\MAS_AIO.cmd 重试。"
-}
-
-& $updateStatus $verdict
-if ($tail) {
-    $info.Text = "• 由 SYSTEM-Intel-MIC 构建`r`n• 激活日志尾部：`r`n$tail"
-}
-# 停留一会儿让用户看得到结果，也能随时手动关掉
-Start-Sleep -Seconds 20
-$win.Dispatcher.Invoke([Action]{ $win.Close() })
+# ShowDialog 阻塞在这里并**持续泵消息**，窗口因此可拖动/可点击/可关闭；
+# 后台 runspace 完成后 30 秒自动关闭，用户也可以随时手动关掉。
+$null = $win.ShowDialog()
+$timer.Stop()
+if ($closeTimer) { $closeTimer.Stop() }
+try { $runspace.Stop() } catch { <# ignore #> }
+try { $runspace.Dispose() } catch { <# ignore #> }
 '@
         # utf8BOM：FirstBoot.ps1 由 RunOnce 里的 Windows PowerShell 5.1 执行，
         # 无 BOM 的 UTF-8 会被 5.1 当成 ANSI 解码，中文会变乱码
@@ -1521,7 +1769,10 @@ function Invoke-IsoReseal([System.IO.FileInfo] $Iso, [string] $Xml) {
     if (-not $Xml) { throw 'Invoke-IsoReseal 需要调用方先生成好 autounattend.xml 内容' }
     if (-not (Test-XmlWellFormed $Xml)) { throw "autounattend.xml 不是合法 XML：`n$Xml" }
     $answerFile = Join-Path $tree 'autounattend.xml'
-    Set-Content -LiteralPath $answerFile -Value $Xml -Encoding utf8
+    # utf8BOM：Setup 读应答文件靠 BOM/声明判定编码，文件里有中文（OemProvider
+    # 「SYSTEM-Intel-MIC的B站个人主页」），无 BOM 时会被当成 ANSI 读，轻则 OEM
+    # 「获取帮助」文字变乱码，重则整份应答文件解析失败导致无人值守不生效。
+    Set-Content -LiteralPath $answerFile -Value $Xml -Encoding utf8BOM
     Write-Info "已写入 autounattend.xml ($([math]::Round((Get-Item $answerFile).Length / 1KB, 1)) KB)"
 
     # ---- 往 install.wim 里塞 OEM logo（失败只警告，不拖垮已经跑了一个多小时的构建）----
