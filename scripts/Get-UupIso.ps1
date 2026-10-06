@@ -305,6 +305,9 @@ function New-UnattendXml {
     }
 
     $hasHw   = [bool]$HwBypass
+    # 无论其它开关怎么配，都必须拦住自动更新（安装期 + OOBE + 系统运行期都要），
+    # 所以应答文件永远要生成，下面 return $null 的判断里也把它算进去。
+    $blockUpdates = $true
     $hasOobe = [bool]$SkipOobe
     $hasAcct = -not [string]::IsNullOrWhiteSpace($LocalUser)
     $hasOem  = -not [string]::IsNullOrWhiteSpace($oemLogoPath) -or
@@ -316,7 +319,7 @@ function New-UnattendXml {
                -not [string]::IsNullOrWhiteSpace($OemModel) -or
                -not [string]::IsNullOrWhiteSpace($OemPhone)
 
-    if (-not ($hasHw -or $hasOobe -or $hasAcct -or $hasOem)) { return $null }
+    if (-not ($hasHw -or $hasOobe -or $hasAcct -or $hasOem -or $blockUpdates)) { return $null }
 
     $cp = 'processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"'
     $x = @()
@@ -326,8 +329,8 @@ function New-UnattendXml {
     $x += '          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
     $x += '  <!-- 自动生成的无人值守应答文件：免硬件检测 / 跳过 OOBE / OEM 信息 -->'
 
-    # ---- windowsPE：先于硬件兼容性检查写 LabConfig ----
-    if ($hasHw -or $loc) {
+    # ---- windowsPE：先于硬件兼容性检查写 LabConfig；同时拦住安装期的自动更新 ----
+    if ($hasHw -or $loc -or $blockUpdates) {
         $x += '  <settings pass="windowsPE">'
         if ($loc) {
             $x += '    <component name="Microsoft-Windows-International-Core-WinPE" ' + $cp + '>'
@@ -340,16 +343,32 @@ function New-UnattendXml {
             $x += '      <UserLocale>' + $loc.user + '</UserLocale>'
             $x += '    </component>'
         }
-        if ($hasHw) {
+        if ($hasHw -or $blockUpdates) {
+            $syncCmds = @()
+            if ($hasHw) {
+                foreach ($v in @('BypassTPMCheck', 'BypassSecureBootCheck', 'BypassRAMCheck')) {
+                    $syncCmds += @{ d = $v; p = "reg add HKLM\SYSTEM\Setup\LabConfig /v $v /t REG_DWORD /d 1 /f" }
+                }
+            }
+            if ($blockUpdates) {
+                # 装机期同样不许更新：
+                # 1) WinPE 自己的 wuauserv 关掉 → 安装程序不会去 WU 拉"安装动态更新"(Setup DU)，
+                #    既省时间又不会把更新塞回镜像（PE 注册表不进成品，只作用于安装过程）；
+                # 2) 把 AU 策略写进 PE 注册表，拦住 OOBE 阶段的检查更新。
+                $syncCmds += @{ d = 'DisableWUinPE'; p = 'sc config wuauserv start= disabled' }
+                $syncCmds += @{ d = 'NoAutoUpdate'; p = 'reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU /v NoAutoUpdate /t REG_DWORD /d 1 /f' }
+                $syncCmds += @{ d = 'AUOptions'; p = 'reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU /v AUOptions /t REG_DWORD /d 2 /f' }
+                $syncCmds += @{ d = 'AutoInstallMinorUpdates'; p = 'reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU /v AutoInstallMinorUpdates /t REG_DWORD /d 0 /f' }
+            }
             $x += '    <component name="Microsoft-Windows-Setup" ' + $cp + '>'
             $x += '      <RunSynchronous>'
             $n = 0
-            foreach ($v in @('BypassTPMCheck', 'BypassSecureBootCheck', 'BypassRAMCheck')) {
+            foreach ($c in $syncCmds) {
                 $n++
                 $x += '        <RunSynchronousCommand wcm:action="add">'
                 $x += '          <Order>' + $n + '</Order>'
-                $x += '          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v ' + $v + ' /t REG_DWORD /d 1 /f</Path>'
-                $x += '          <Description>' + $v + '</Description>'
+                $x += '          <Path>' + (Escape-Xml $c.p) + '</Path>'
+                $x += '          <Description>' + (Escape-Xml $c.d) + '</Description>'
                 $x += '        </RunSynchronousCommand>'
             }
             $x += '      </RunSynchronous>'
@@ -438,53 +457,78 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
         if ($LASTEXITCODE -ne 0) { throw "dism /Mount-Wim 失败，退出码 $LASTEXITCODE" }
 
         # ---- 1. 移除 Provisioned Appx 包（保留核心媒体/商店/照片/相机）----
-        $keep = @('ZuneVideo', 'ZuneMusic', 'Music', 'MediaPlayer', 'MicrosoftEdge', 'WindowsStore', 'Windows.Photos',
-                  'WindowsCamera', 'Windows.Media.Viewer', 'Codec', 'ScreenSketch', 'SnippingTool',
-                  'Notepad', 'Photos', 'Camera', 'Store', 'FeedbackHub', 'GetHelp', 'Getstarted',
-                  'Paint', 'Calculator', 'Clock', 'Cortana', 'Solitaire', 'Xbox', 'Gaming',
-                  'ActionCenter', 'Alarms', 'BingNews', 'BingWeather', 'BingTravel', 'BingSports',
-                  'BingFinance', 'GetOffice', 'OfficeHub', 'Outlook', 'OneDrive', 'Teams',
-                  'Todos', 'Translator', 'VoiceRecorder', 'Wallet', 'Weather', 'XboxGameOverlay',
-                  'XboxGamingOverlay', 'XboxIdentityProvider', 'XboxSpeechToTextOverlay',
-                  'YourPhone', 'PhotosLegacy', 'PhotosEditor', 'People', 'Maps', 'Travel',
-                  'Money', 'Sports', 'OneNote', 'Sway', 'WindowsAlarms', 'Print3D', 'MixedReality',
-                  '3DViewer', 'Tips', 'FeedbackHub', 'Microsoft3DViewer', 'OfficeHub', 'GetOffice',
-                  'MicrosoftOfficeHub', 'MicrosoftStore', 'WindowsCalculator', 'WindowsAlarms',
-                  'WindowsCamera', 'WindowsFeedbackHub', 'WindowsMaps', 'WindowsSoundRecorder',
-                  'WindowsStore', 'WindowsVoiceRecorder', 'Windows.Wallet', 'Xbox', 'ZuneMusic',
-                  'ZuneVideo', 'Microsoft.BingNews', 'Microsoft.BingWeather', 'Microsoft.GetHelp',
-                  'Microsoft.Getstarted', 'Microsoft.Microsoft3DViewer', 'Microsoft.MicrosoftOfficeHub',
-                  'Microsoft.MicrosoftStore', 'Microsoft.MicrosoftStickyNotes', 'Microsoft.MixedReality.Portal',
-                  'Microsoft.MSPaint', 'Microsoft.OfficeHub', 'Microsoft.OneNote', 'Microsoft.People',
-                  'Microsoft.Print3D', 'Microsoft.Skype...', 'Microsoft.Solitaire...', 'Microsoft.StickyNotes',
-                  'Microsoft.Todos', 'Microsoft.Wallet', 'Microsoft.Windows.Alarms', 'Microsoft.Windows.Camera',
-                  'Microsoft.Windows.FeedbackHub', 'Microsoft.Windows.GetHelp', 'Microsoft.Windows.Getstarted',
-                  'Microsoft.Windows.Maps', 'Microsoft.Windows.SnippingTool', 'Microsoft.Windows.SoundRecorder',
-                  'Microsoft.WindowsAlarms', 'Microsoft.WindowsCamera', 'Microsoft.WindowsCalculator',
-                  'Microsoft.WindowsFeedbackHub', 'Microsoft.WindowsMaps', 'Microsoft.WindowsSoundRecorder',
-                  'Microsoft.XboxGamingOverlay', 'Microsoft.XboxIdentityProvider', 'Microsoft.XboxSpeechToTextOverlay',
-                  'Microsoft.ZuneMusic', 'Microsoft.ZuneVideo', 'MicrosoftTeams', 'MicrosoftSolitaireCollection',
-                  'Microsoft3DViewer', 'MicrosoftOfficeHub', 'MicrosoftPeople', 'MicrosoftPrint3D',
-                  'MicrosoftStickyNotes', 'MicrosoftWallet', 'MicrosoftWindowsMaps', 'MicrosoftXboxApp',
-                  'MicrosoftXboxIdentityProvider', 'MicrosoftXboxSpeechToTextOverlay', 'MicrosoftGameBar',
-                  'MicrosoftGameBarPresenceWriter', 'MicrosoftGameConfig', 'MicrosoftGamingApp',
-                  'MicrosoftGamingServices', 'MicrosoftXboxApp', 'Xbox.TCUI', 'XboxGameOverlay',
-                  'XboxGameCallableUI', 'XboxIdentityProvider', 'XboxGamingOverlay', 'XboxSpeechToTextOverlay',
-                  # ---- ~~By则~~ EXTEND ----
-                  'WindowsNotepad', 'WindowsTerminal', 'Microsoft.WindowsTerminal',
-                  # ---- 运行库（用户点名保留）：WindowsAppRuntime.1.x 是大量应用的依赖，绝不能删 ----
-                  'WindowsAppRuntime', 'WindowsAppSDK', 'Microsoft.WindowsAppRuntime',
-                  'Microsoft.VCLibs', 'VCLibs.140.00', 'Microsoft.NET.Native', 'NETNative.Framework', 'NETNative.Runtime',
-                  'Microsoft.DesktopAppInstaller', 'DesktopAppInstaller', 'Microsoft.UI.Xaml', 'UI.Xaml.2.7', 'UI.Xaml.2.8',
-                  'WebView', 'Microsoft.WebMediaExtensions', 'Microsoft.WebpImageExtension', 'Microsoft.VP9VideoExtensions',
-                  'Microsoft.RawImageExtension', 'Microsoft.HEIFImageExtension', 'Microsoft.AV1VideoExtension',
-                  'Microsoft.AVCEncoderVideoExtension', 'Microsoft.MPEG2VideoExtension', 'Microsoft.HEVCVideoExtension',
-                  'Microsoft.WidgetsPlatformRuntime', 'Microsoft.Widgets', 'Microsoft.PowerAutomateDesktop',
-                  'Microsoft.GamingApp', 'Microsoft.ApplicationCompatibilityEnhancements', 'Microsoft.StartExperiencesApp',
-                  'Microsoft.StorePurchaseApp', 'Microsoft.Services.Store.Engagement', 'Microsoft.ScreenSketch',
-                  'Microsoft.OutlookForWindows', 'Clipchamp', 'Microsoft.Paint', 'MicrosoftCorporationII.QuickAssist',
-                  'MicrosoftCorporationII.MicrosoftFamily', 'MicrosoftWindows.Client.WebExperience',
-                  'MicrosoftWindows.CrossDevice', 'MSTeams', 'MSTeams.Client')
+        # ---- 1. 移除 Provisioned Appx 包 ----
+        # $keep 是**保留白名单**，匹配方式是包含匹配（*关键词*）：命中就留，
+        # 没命中的全部 /Remove-ProvisionedAppxPackage 删掉，日志逐包打印 [keep]/[fail]。
+        #
+        # 上一版把 Xbox / 纸牌 / 微软资讯 / 手机连接 / 获取帮助等垃圾也写进了白名单，
+        # 于是全被保住（装机实测发现）。现在只留「用户点名要的 + 运行库/编解码器依赖」：
+        #   记事本 / PowerShell终端 / 画图 / 计算器 / 截图 / 闹钟 / Edge / 商店 /
+        #   照片 / 相机 / 媒体播放器，以及全部编解码器和运行库。
+        # 被移除的都是 Store 里随时能装回来的，不涉及系统功能。
+        $keep = @(
+            # ---- 用户点名保留的日常应用 ----
+            'Notepad', 'WindowsNotepad',                  # 记事本
+            'WindowsTerminal',                            # Windows Terminal / PowerShell
+            'MSPaint', 'Paint',                            # 画图
+            'WindowsCalculator',                           # 计算器
+            'ScreenSketch', 'SnippingTool',                # 截图
+            'WindowsAlarms', 'Alarms',                     # 闹钟
+            'MicrosoftEdge',                               # Edge
+            'WindowsStore', 'StorePurchaseApp', 'MicrosoftStore',
+            'Services.Store.Engagement',                   # 应用商店 + 购买/更新依赖
+            'Windows.Photos', 'Photos',                    # 照片
+            'WindowsCamera', 'Camera',                     # 相机
+            'ZuneVideo', 'ZuneMusic', 'MediaPlayer',       # 媒体播放器 / 影视 / 音乐
+            'DesktopAppInstaller',                         # winget
+
+            # ---- 编解码器（缺了 WebP/HEIF/AV1/HEVC 的视频和图片就打不开）----
+            'WebMediaExtensions', 'VP9VideoExtensions', 'HEIFImageExtension',
+            'AV1VideoExtensions', 'MPEG2VideoExtensions', 'HEVCVideoExtension',
+            'AVCEncoderVideoExtension', 'RawImageExtension', 'WebpImageExtension',
+            'Codec',
+
+            # ---- 运行库 / 依赖（删了会连带废掉一批应用，绝不能动）----
+            'WindowsAppRuntime', 'WindowsAppSDK', 'VCLibs',
+            'NET.Native', 'UI.Xaml', 'WebView',
+            'WidgetsPlatformRuntime', 'PowerAutomateDesktop',
+            'StartExperiencesApp', 'ApplicationCompatibilityEnhancements'
+        )
+
+        # 下面这些**故意不在白名单里**，会被移除（用户点名 + 预装垃圾）：
+        #   Xbox 全家（Xbox.TCUI / GamingOverlay / IdentityProvider / SpeechToText / GamingApp）
+        #   纸牌 MicrosoftSolitaireCollection、微软资讯 BingNews、天气 BingWeather
+        #   手机连接 YourPhone、跨设备 CrossDevice、获取帮助 GetHelp、入门 Getstarted
+        #   反馈中心 WindowsFeedbackHub、Office 推广 MicrosoftOfficeHub
+        #   便笺 StickyNotes、待办 Todos、Clipchamp、录音机 SoundRecorder
+        #   家庭 MicrosoftFamily、快速助手 QuickAssist、小组件前端 WebExperience
+        #   Teams（MSTeams）、新版 Outlook（OutlookForWindows）、OneDrive
+        # 需要哪个就把对应关键词加回上面的 $keep。
+        #
+        # $forceRemove 是**强删名单**，优先级高于 $keep：
+        # 哪怕包名里恰好带上了保留关键词（比如 "...Teams..." 撞上别的词），
+        # 只要命中下面任意一条就一律移除，杜绝"该删没删"。
+        $forceRemove = @(
+            'MSTeams', 'Teams',                 # Teams（聊天/会议，用不到就删）
+            'OutlookForWindows', 'Outlook',     # 新版 Outlook（PWA）
+            'OneDrive',                         # OneDrive 网盘
+            'Xbox', 'GamingApp',                # Xbox 全家
+            'MicrosoftSolitaireCollection',     # 纸牌
+            'BingNews', 'BingWeather',          # 微软资讯 / 天气
+            'YourPhone', 'CrossDevice',         # 手机连接 / 跨设备
+            'GetHelp', 'Getstarted',            # 获取帮助 / 入门
+            'WindowsFeedbackHub',               # 反馈中心
+            'MicrosoftOfficeHub',               # Office 推广
+            'StickyNotes', 'Todos',             # 便笺 / 待办
+            'Clipchamp', 'SoundRecorder',       # AI 剪辑 / 录音机
+            'MicrosoftFamily', 'QuickAssist',   # 家庭 / 快速助手
+            'WebExperience',                    # 小组件前端（含资讯流）
+            'WindowsCommunicationsApps',        # 邮件/日历（旧版）
+            'People', 'Print3D', '3DViewer',    # 人脉 / 3D 打印 / 3D 查看器
+            'MixedReality', 'Cortana',           # 混合现实 / 小娜
+            'WindowsMaps', 'Maps',              # 地图
+            'WindowsWallet', 'Wallet'           # 钱包
+        )
 
         $allAppx = (dism.exe /Image:$mnt /Get-ProvisionedAppxPackages 2>&1) |
             Select-String 'PackageName : (.+)' | ForEach-Object { $_.Matches[0].Groups[1].Value }
@@ -494,6 +538,10 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
             foreach ($k in $keep) {
                 if ($app -like "*$k*") { $shouldKeep = $true; break }
             }
+            # 强删名单优先级更高：命中就直接删，不再看 $keep
+            foreach ($f in $forceRemove) {
+                if ($app -like "*$f*") { $shouldKeep = $false; break }
+            }
             # 全量打印判定结果：日志里能看到镜像到底 provision 了哪些包，
             # 下次判断"这个包该不该留、占多大"时不用再靠猜。
             if ($shouldKeep) { Write-Host "    [keep]    $app"; continue }
@@ -502,14 +550,60 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
             else { Write-Host "    [fail]    $app (退出码 $LASTEXITCODE)" }
         }
 
+        # ---- 1b. 系统级移除 OneDrive ----
+        # OneDrive 在 Win11 里不是 provisioned 包，而是 System32\SysWOW64 下的
+        # OneDriveSetup.exe + 注册表 Run 键，首次登录会自动把它装回来。
+        # 三样一起清掉才干净；删不掉只警告，不影响构建。
+        foreach ($odExe in @('Windows\System32\OneDriveSetup.exe',
+                             'Windows\SysWOW64\OneDriveSetup.exe')) {
+            $odFull = Join-Path $mnt $odExe
+            if (Test-Path -LiteralPath $odFull) {
+                try { Remove-Item -LiteralPath $odFull -Force -ErrorAction Stop
+                      Write-Info "已删除 $odExe" }
+                catch { Write-Warning "删除 $odExe 失败: $_" }
+            }
+        }
+        # 卸载已解包的 OneDrive 文件（装机前镜像里通常还没有）
+        foreach ($odDir in @('Program Files\Microsoft OneDrive',
+                             'Program Files (x86)\Microsoft OneDrive')) {
+            $odFull = Join-Path $mnt $odDir
+            if (Test-Path -LiteralPath $odFull) {
+                try { Remove-Item -LiteralPath $odFull -Recurse -Force -ErrorAction Stop
+                      Write-Info "已删除 $odDir" }
+                catch { Write-Warning "删除 $odDir 失败: $_" }
+            }
+        }
+
         # ---- 2. 移除 Capability（AI/Copilot/Recall 等）----
-        $capsToRemove = @(
-            'Recall', 'Microsoft.Windows.AI.Copilot.Provider', 'Microsoft.Copilot',
-            'Microsoft.Windows.Clipchamp', 'Microsoft.Windows.Photos.AI', 'Microsoft.Windows.AppRuntime.AI'
+        # 先 /Get-Capabilities 打出镜像里全部 capability，再按关键词**模糊匹配**移除。
+        # 精确写死名字会随 build 变化漏项（28020 实测就漏了 Recall 和 AI 平台的其它子项），
+        # 模糊匹配 + 打印全表，日志里能逐条核对删了什么、还剩什么。
+        $capPatterns = @(
+            'Recall',                      # 录屏 + AI 回溯（Windows 聚焦记忆）
+            'Copilot',                     # Copilot 全部能力（含 AI.Copilot.Provider）
+            'Clipchamp',                   # Clipchamp AI 视频剪辑
+            'Photos.AI',                   # 照片 AI（老照片修复/背景消除）
+            'AppRuntime.AI',               # Windows App Runtime 的 AI 分发
+            'Microsoft.Windows.AI',        # Windows AI 平台全家（Ai.Clients / Ai.Foundation…）
+            'Microsoft.Windows.Ai',
+            'SemanticIndex',               # 语义索引（Recall / AI 搜索的索引后端）
+            'MathRecognizer',              # 手写公式 AI 识别
+            'AIFoundry', 'AiFoundry', 'WindowsAI',
+            'DevHome'                      # 开发者主页（预装无效应用）
         )
-        foreach ($cap in $capsToRemove) {
+        $capIds = @(dism.exe /Image:$mnt /Get-Capabilities /English 2>&1 |
+            Select-String 'Identity : (.+)' |   # 宽松匹配，防 DISM 字段名变动导致一条都匹配不上
+            ForEach-Object { $_.Matches[0].Groups[1].Value })
+        if ($capIds.Count -eq 0) { Write-Warning "没能解析出 Capability 列表，AI 组件可能没删干净，请核对日志里 dism 的原始输出" }
+        Write-Info "镜像内 Capability $($capIds.Count) 个，全部列出供核对："
+        foreach ($c in $capIds) { Write-Host "    [cap] $c" }
+        foreach ($cap in $capIds) {
+            $hit = $false
+            foreach ($pat in $capPatterns) { if ($cap -like "*$pat*") { $hit = $true; break } }
+            if (-not $hit) { continue }
             dism.exe /Image:$mnt /Remove-Capability /CapabilityName:$cap 2>&1 | Out-Null
             if ($LASTEXITCODE -eq 0) { Write-Info "已移除 Capability: $cap" }
+            else { Write-Host "    [cap-fail] $cap (退出码 $LASTEXITCODE)" }
         }
 
         # ---- 2b. 体积诊断（清理前）：看清空间都在哪，清理前后各测一次算净收益 ----
@@ -538,10 +632,39 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
             'Fax',                     # 传真
             'SMB1Protocol',            # 废弃且不安全的 SMB1
             'TelnetClient', 'SimpleTCP', 'ClientForNFS',   # 明文/老式协议
+            'ServicesForNFS', 'NFS-Administration',        # NFS 客户端/管理（家用基本不用）
             'RasCMAK', 'LPD', 'LPRPortMonitor', 'TFTP',    # 老网络服务
             'SNMP',                    # 网络管理协议
             'PowerShellV2',            # PowerShell v2 旧引擎（5.1 和 7 完全不受影响）
-            'Rsat', 'DirectoryServices', 'IPAM', 'DataCenterBridging'  # 服务器类工具
+            'Rsat', 'DirectoryServices', 'IPAM', 'DataCenterBridging',  # 服务器类工具
+            # ---- 28020 全表比对后新增：客户端用不到的服务端/嵌入式组件 ----
+            'IIS-',                    # IIS Web 服务器全套（28020 里有 51 个 IIS-*）
+            'WAS-',                    # IIS 进程激活服务（WAS-* 3 个）
+            'MSMQ-',                   # 消息队列（MSMQ-* 7 个）
+            'WCF-',                    # WCF 服务/激活（WCF-* 6 个）
+            'Client-',                 # 嵌入式锁定设备（Kiosk/键盘过滤/UWF 等 7 个）
+            'MultiPoint',              # MultiPoint 多点服务（教室场景）
+            'Sysmon',                  # 系统监视器（Sysmon、Sysmon-Service）
+            'HostGuardian',            # 主机守护（HGS，虚拟化安全）
+            'AppServerClient',         # 远程应用客户端（RemoteApp）
+            'NetFx4-AdvSrvs',          # .NET 高级服务（WCF/ASP.NET 扩展）
+            'NetFx4Extended-ASPNET45', # ASP.NET 4.5 扩展
+            'SmbDirect',               # RDMA 网卡直连（家用网卡用不到）
+            'InternetPrinting',        # 互联网打印（本地打印/存 PDF 不受影响）
+            'Recall'                   # ⭐ AI 回溯：录屏 + 语义搜索（必须删）
+        )
+        # 反向白名单：即使命中上面的关键词也绝不删（用户点名 + 虚拟化/打印/搜索/安全基础）
+        $featuresKeep = @(
+            'DirectPlay', 'LegacyComponents',  # 旧版组件：老游戏（Age3/红警）要靠它
+            'MediaPlayback', 'WindowsMediaPlayer',   # 用户点名保留的媒体播放器
+            'SearchEngine',            # 开始菜单搜索
+            'Windows-Defender',        # Defender 定义
+            'Printing-Foundation-Features', 'PrintToPDF',  # 打印 / 另存为 PDF
+            'MSRDC',                   # 远程桌面客户端
+            'TIFFIFilter',             # TIFF 预览（照片看图）
+            'Containers', 'Hyper-V', 'HypervisorPlatform', 'VirtualMachinePlatform',
+            'Subsystem-Linux',         # Docker/WSL/虚拟机
+            'Camera'                   # 相机
         )
         # /English：镜像是 zh-CN，不强制英文就解析不出 Feature Name
         $featList = @(dism.exe /Image:$mnt /Get-Features /English 2>&1 |
@@ -551,6 +674,11 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
         foreach ($f in $featList) {
             $hit = $false
             foreach ($pat in $featuresToRemove) { if ($f -like "*$pat*") { $hit = $true; break } }
+            if (-not $hit) { continue }
+            # 反向白名单优先：命中保留名单就不删（比如 XPS 关键词撞上打印组件时）
+            foreach ($k in $featuresKeep) {
+                if ($f -like "*$k*") { $hit = $false; Write-Host "    [feature-keep] $f"; break }
+            }
             if (-not $hit) { continue }
             # 必须 /Remove：只 /Disable 不删文件，一点空间都省不下来
             dism.exe /Image:$mnt /Disable-Feature /FeatureName:$f /Remove /NoRestart 2>&1 | Out-Null
@@ -611,7 +739,9 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
             # 设备元数据 / 商店推送安装 / 远程注册表 / 嵌入式模式
             'DevicesAnalytics', 'PushToInstall', 'RemoteRegistry', 'EmbeddedMode',
             # 远程桌面 USB 重定向（TermService 保留，仍可远程桌面）
-            'UmRdpService'
+            'UmRdpService',
+            # Windows Insider 服务 / 扫描仪 WIA（不用扫描仪，Spooler 保留）
+            'wisvc', 'stisvc'
         ) | Select-Object -Unique
 
         $systemHive = Join-Path $mnt 'Windows\System32\config\SYSTEM'
@@ -688,10 +818,23 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                     @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\System"; Name = 'EnableTaskScheduler'; Value = 1; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\Explorer"; Name = 'NoAutoplayfornon-volume devices'; Value = 1; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\Explorer"; Name = 'NoDriveTypeAutoRun'; Value = 255; Type = 'DWord' },
-                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate\AU"; Name = 'NoAutoUpdate'; Value = 0; Type = 'DWord' },
-                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate\AU"; Name = 'AUOptions'; Value = 4; Type = 'DWord' },
-                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate"; Name = 'DeferFeatureUpdatesPeriodInDays'; Value = 0; Type = 'DWord' },
-                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate"; Name = 'DeferQualityUpdatesPeriodInDays'; Value = 0; Type = 'DWord' },
+                    # ---- 禁止自动更新（用户硬需求：装完和 OOBE 都不能自己更）----
+                    # NoAutoUpdate=1  → 彻底关掉"自动检查/下载/安装"，但设置里手动
+                    #                   "检查更新"仍然可用（手动更新能力保留）；
+                    # AUOptions=2     → 万一策略被绕过，也只允许"通知下载并通知安装"；
+                    # AutoInstallMinorUpdates=0 → 连小更新都不许悄悄装；
+                    # Defer 400 天    → 功能更新/质量更新推迟到 400 天（约等于永不来）；
+                    # NoAutoRebootWithLoggedOnUsers=1 → 就算有更新也不许自动重启；
+                    # ExcludeWUDriversInQualityUpdate=1 → Windows Update 不自动装驱动。
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate\AU"; Name = 'NoAutoUpdate'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate\AU"; Name = 'AUOptions'; Value = 2; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate\AU"; Name = 'AutoInstallMinorUpdates'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate"; Name = 'DeferFeatureUpdatesPeriodInDays'; Value = 400; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate"; Name = 'DeferQualityUpdatesPeriodInDays'; Value = 400; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate"; Name = 'NoAutoRebootWithLoggedOnUsers'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate"; Name = 'ExcludeWUDriversInQualityUpdate'; Value = 1; Type = 'DWord' },
+                    # 应用商店也不许自己更新（否则被删的预装应用可能被商店推回来）
+                    @{ Path = "$hiveLabel\Policies\Microsoft\WindowsStore"; Name = 'DisableAutoUpdate'; Value = 1; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Policies\Microsoft\Windows\DeliveryOptimization"; Name = 'DownloadMode'; Value = 0; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Microsoft\Windows\DeliveryOptimization"; Name = 'DeviceUniqueId'; Value = ''; Type = 'String' },
                     @{ Path = "$hiveLabel\Microsoft\Windows\DeliveryOptimization"; Name = 'CacheMemorySizeInBytes'; Value = 0; Type = 'DWord' },
@@ -721,7 +864,40 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                     @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsAI"; Name = 'DisableClickToDo'; Value = 1; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\WindowsAI"; Name = 'RemoveMicrosoftCopilotApp'; Value = 1; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\WindowsAI"; Name = 'DisableAIActions'; Value = 1; Type = 'DWord' },
-                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\WindowsAI"; Name = 'DisableClickToDo'; Value = 1; Type = 'DWord' }
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\WindowsAI"; Name = 'DisableClickToDo'; Value = 1; Type = 'DWord' },
+
+                    # ---- 锁屏聚焦 / 开始菜单推广 / 广告（CloudContent 策略）----
+                    # DisableWindowsSpotlightFeatures=1 → 锁屏不再轮播"Windows 聚焦"壁纸（省网络+省后台）
+                    # DisableSoftLanding=1             → 开始菜单不再推"提示和建议"
+                    # DisableThirdPartySuggestions=1   → 不推第三方应用建议
+                    # DisableTailoredExperiencesWithDiagnosticData=1 → 不用诊断数据做个性化推荐
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\CloudContent"; Name = 'DisableWindowsSpotlightFeatures'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\CloudContent"; Name = 'DisableWindowsSpotlightOnSettings'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\CloudContent"; Name = 'DisableWindowsSpotlightOnActionCenter'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\CloudContent"; Name = 'DisableSoftLanding'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\CloudContent"; Name = 'DisableThirdPartySuggestions'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\CloudContent"; Name = 'DisableTailoredExperiencesWithDiagnosticData'; Value = 1; Type = 'DWord' },
+
+                    # ---- 广告 ID / 个性化广告 ----
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\AdvertisingInfo"; Name = 'DisabledByGroupPolicy'; Value = 1; Type = 'DWord' },
+
+                    # ---- 活动历史记录（时间线 / 云端同步用户操作）----
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\System"; Name = 'EnableActivityFeed'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\System"; Name = 'PublishUserActivities'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\System"; Name = 'UploadUserActivities'; Value = 0; Type = 'DWord' },
+
+                    # ---- 关掉 C 盘预留空间（Win11 默认锁约 7 GB 给"更新储备"）----
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\ReserveManager"; Name = 'ShippedWithReserves'; Value = 0; Type = 'DWord' },
+
+                    # ---- 静默装应用（HKLM 版，配合 DEFAULT hive 的 HKCU 版双保险）----
+                    # SilentInstalledAppsEnabled=0 → 系统不再往开始菜单里"赠送"Candy Crush 之类
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; Name = 'SilentInstalledAppsEnabled'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; Name = 'PreInstalledAppsEnabled'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; Name = 'OemPreInstalledAppsEnabled'; Value = 0; Type = 'DWord' },
+
+                    # ---- OneDrive：卸载首次登录自动安装（Run 键删值）----
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Run"; Name = 'OneDriveSetup'; Value = ''; Type = 'Delete' },
+                    @{ Path = "$hiveLabel\Wow6432Node\Microsoft\Windows\CurrentVersion\Run"; Name = 'OneDriveSetup'; Value = ''; Type = 'Delete' }
                 )
 
                 # 跳过 OOBE 相关（skip_oobe 打开时才写）：
@@ -743,11 +919,15 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                     try {
                         if ($reg.Type -eq 'DWord') {
                             $null = reg.exe add $keyPath /v $reg.Name /t REG_DWORD /d $reg.Value /f 2>&1
+                        } elseif ($reg.Type -eq 'Delete') {
+                            # 删值（OneDrive 的 Run 键之类），值不存在时 reg 会返回非 0，忽略即可
+                            $null = reg.exe delete $keyPath /v $reg.Name /f 2>&1
                         } else {
                             $null = reg.exe add $keyPath /v $reg.Name /t REG_SZ /d $reg.Value /f 2>&1
                         }
                         if ($LASTEXITCODE -eq 0) {
-                            Write-Info "已设置注册表: $($reg.Path)\\$($reg.Name) = $($reg.Value)"
+                            if ($reg.Type -eq 'Delete') { Write-Info "已删除注册表值: $($reg.Path)\\$($reg.Name)" }
+                            else { Write-Info "已设置注册表: $($reg.Path)\\$($reg.Name) = $($reg.Value)" }
                         }
                     } catch { <# ignore #> }
                 }
@@ -759,45 +939,225 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
             }
         }
 
+        # ---- 4b. DEFAULT 用户 hive：新用户首次登录的 HKCU 默认值 ----
+        # Windows 新建账户时会拷贝 C:\Users\Default\NTUSER.DAT 当模板，
+        # 所以下面写进去的值对**之后创建的每个账户**都生效。
+        # 之前有一半优化写在 HKLM 下，其实根本改不到这些 per-user 键（白写）。
+        $defaultHive = Join-Path $mnt 'Users\Default\NTUSER.DAT'
+        if (Test-Path -LiteralPath $defaultHive) {
+            $hiveLabel = 'HKLM\WWINBLDG_DEFAULT'
+            $null = reg.exe load $hiveLabel $defaultHive 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                $defaultReg = @(
+                    # 不让系统静默给新账户塞应用（"装完自己又冒出一堆 Appx"的元凶）
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; Name = 'SilentInstalledAppsEnabled'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; Name = 'PreInstalledAppsEnabled'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; Name = 'OemPreInstalledAppsEnabled'; Value = 0; Type = 'DWord' },
+                    # 开始菜单"推荐的项目" / 应用推广（338388=推荐、338389=提示、338393=账户提示）
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; Name = 'SystemPaneSuggestionsEnabled'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; Name = 'SubscribedContent-338388Enabled'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; Name = 'SubscribedContent-338389Enabled'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; Name = 'SubscribedContent-338393Enabled'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; Name = 'RotatingLockScreenOverlayEnabled'; Value = 0; Type = 'DWord' },
+                    # 广告 ID / 诊断数据个性化
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo"; Name = 'Enabled'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\Privacy"; Name = 'TailoredExperiencesWithDiagnosticDataEnabled'; Value = 0; Type = 'DWord' },
+                    # 任务栏：隐藏小组件按钮（WebExperience 已移除，留着是死按钮）、隐藏"任务视图"
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"; Name = 'TaskbarDa'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"; Name = 'ShowTaskViewButton'; Value = 0; Type = 'DWord' },
+                    # 搜索框只留图标，省一段常驻 UI
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\Search"; Name = 'SearchboxTaskbarMode'; Value = 2; Type = 'DWord' },
+                    # 资源管理器：显示文件扩展名（防钓鱼 .exe 伪装）+ 打开时直接进"此电脑"
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"; Name = 'HideFileExt'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"; Name = 'LaunchTo'; Value = 1; Type = 'DWord' },
+                    # 性能：关掉透明特效（少一层合成）、新程序不延迟高亮
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"; Name = 'EnableTransparency'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize"; Name = 'StartupDelayInMSec'; Value = 0; Type = 'DWord' },
+                    # 位置服务（系统级关闭，设置→隐私 里可再开）
+                    @{ Path = "$hiveLabel\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location"; Name = 'Value'; Value = 'Deny'; Type = 'String' }
+                )
+                foreach ($reg in $defaultReg) {
+                    try {
+                        if ($reg.Type -eq 'DWord') {
+                            $null = reg.exe add $reg.Path /v $reg.Name /t REG_DWORD /d $reg.Value /f 2>&1
+                        } else {
+                            $null = reg.exe add $reg.Path /v $reg.Name /t REG_SZ /d $reg.Value /f 2>&1
+                        }
+                        if ($LASTEXITCODE -eq 0) { Write-Info "已设置默认账户注册表: $($reg.Name) = $($reg.Value)" }
+                    } catch { <# ignore #> }
+                }
+                [System.GC]::Collect()
+                Start-Sleep -Milliseconds 200
+                $null = reg.exe unload $hiveLabel 2>&1
+                Write-Info "DEFAULT hive unload 结果: $LASTEXITCODE"
+            } else {
+                Write-Warning "DEFAULT hive load 失败，跳过新用户默认值优化"
+            }
+        }
+
+        # ---- 4c. 删掉会自己跑更新的计划任务 ----
+        # 策略（NoAutoUpdate）只管"Windows Update 主程序"，计划任务是另一条触发路径。
+        # 直接删 Tasks 目录下的任务文件即可，离线状态最省事，且只删更新/遥测类，
+        # 不碰磁盘整理、系统诊断、Defender 扫描这些正经任务。
+        $tasksDir = Join-Path $mnt 'Windows\System32\Tasks\Microsoft\Windows'
+        $taskFiles = @(
+            'WindowsUpdate\Scheduled Start',          # ⭐ 例行 Windows 更新（会自动下载安装）
+            'WindowsUpdate\Orchestrator\USO_UxBroker',# 更新编排器
+            'WindowsUpdate\Orchestrator\UpdateOrchestrator',
+            'Automatic App Update',                   # 商店应用自动更新
+            'Maps\MapsToastTask', 'Maps\MapsUpdateTask',
+            'Customer Experience Improvement Program\Consolidator',
+            'Customer Experience Improvement Program\UsbCeip',
+            'Application Experience\Microsoft Compatibility Appraiser',
+            'Application Experience\ProgramDataUpdater',
+            'DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector'
+        )
+        foreach ($t in $taskFiles) {
+            $tf = Join-Path $tasksDir $t
+            if (Test-Path -LiteralPath $tf) {
+                try {
+                    Remove-Item -LiteralPath $tf -Force -ErrorAction Stop
+                    Write-Info "已删除计划任务: $t"
+                } catch { Write-Warning "删除计划任务 $t 失败: $_" }
+            }
+        }
+
         # ---- 5. 写入 SetupComplete.cmd + FirstBoot.ps1 ----
         $scriptsDir = Join-Path $mnt 'Windows\Setup\Scripts'
         New-Item -ItemType Directory -Force -Path $scriptsDir | Out-Null
         $setupComplete = Join-Path $scriptsDir 'SetupComplete.cmd'
         $setupCompleteContent = @'
 @echo off
-REM SYSTEM-Intel-MIC SetupComplete
-REM 首次登录前启动 Office 安装（SYSTEM 权限，后台），并创建 RunOnce 将 FirstBoot.ps1 注册到用户首次登录
+REM ===== SYSTEM-Intel-MIC SetupComplete（SYSTEM 身份、首次登录前执行）=====
+REM 1) 后台启动 Office 离线安装
+REM 2) 后台起激活器 Activate.cmd：等 Office 装完 -> 等联网 -> MAS 无人值守激活
+REM 3) 注册 RunOnce，让 FirstBoot.ps1 在用户第一次进桌面时弹窗显示进度
 
-REM 1. 后台启动 Office ODT 安装（如果已下载离线包）
 if exist "C:\OfficeInstall\setup.exe" (
     echo [SYSTEM-Intel-MIC] Starting Office offline installation...
     start "" /MIN "C:\OfficeInstall\setup.exe" /configure "C:\OfficeInstall\configuration.xml"
 )
 
-REM 2. 创建 RunOnce 以便在首次登录时弹窗并等待 Office 安装完成
+if exist "C:\FirstBoot\Activate.cmd" (
+    echo [SYSTEM-Intel-MIC] Starting background activator...
+    start "" /B cmd /c C:\FirstBoot\Activate.cmd
+)
+
 reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" /v SYSTEM_Intel_MIC_FirstBoot /t REG_SZ /d "powershell -NoProfile -ExecutionPolicy Bypass -File C:\FirstBoot\FirstBoot.ps1" /f
 
 exit /b 0
 '@
         Set-Content -LiteralPath $setupComplete -Value $setupCompleteContent -Encoding Ascii
 
-        $firstBootDir = Join-Path $mnt 'FirstBoot'
+                $firstBootDir = Join-Path $mnt 'FirstBoot'
         New-Item -ItemType Directory -Force -Path $firstBootDir | Out-Null
+
+        # ---- Activate.cmd：SYSTEM 后台跑的激活器 ----
+        # 为什么不在 FirstBoot.ps1 里直接跑 MAS：
+        #   * FirstBoot.ps1 是普通用户会话，跑 HWID 要弹 UAC、还可能没权限；
+        #   * 26100+ 的 HWID/TSforge 必须联网，而用户可能还没连网；
+        #   * Office 还没装完时跑 Ohook 一定失败。
+        # 所以交给 SetupComplete 起的 SYSTEM 后台进程，按顺序等两件事再跑 MAS，
+        # 结果写成标记文件，前台的 FirstBoot.ps1 只负责显示。
+        $activateCmd = Join-Path $firstBootDir 'Activate.cmd'
+        $activateContent = @'
+REM ===== SYSTEM-Intel-MIC Activate (SYSTEM, launched by SetupComplete) =====
+REM Wait for Office -> wait for network -> run MAS unattended -> write result marker
+setlocal enabledelayedexpansion
+set LOG=C:\FirstBoot\activation.log
+set RES=C:\FirstBoot\ACTIVATION_RESULT.txt
+set WAITED=0
+set ONLINE=0
+set HWIDCODE=NA
+set OHOOKCODE=NA
+set WIN_LICENSE=NA
+echo [%date% %time%] activator start > "%LOG%"
+
+REM --- 1) Wait until FirstBoot writes OFFICE_DONE (it installs Office), max 90 min ---
+:waitoffice
+if exist "C:\FirstBoot\OFFICE_DONE" goto officedone
+set /a WAITED+=1
+if %WAITED% gtr 360 goto officedone
+ping -n 16 127.0.0.1 >nul
+goto waitoffice
+:officedone
+echo [%date% %time%] office marker: >> "%LOG%"
+if exist "C:\FirstBoot\OFFICE_DONE" type "C:\FirstBoot\OFFICE_DONE" >> "%LOG%"
+
+REM --- 2) Wait for network (26100+ HWID/TSforge needs it), max 30 min ---
+set WAITED=0
+:waitnet
+ping -n 1 -w 2000 223.5.5.5 >nul 2>&1
+if not errorlevel 1 goto netok
+ping -n 1 -w 2000 114.114.114.114 >nul 2>&1
+if not errorlevel 1 goto netok
+set /a WAITED+=1
+if %WAITED% gtr 60 goto netgone
+ping -n 31 127.0.0.1 >nul
+goto waitnet
+:netok
+set ONLINE=1
+echo [%date% %time%] network is up >> "%LOG%"
+goto dorun
+:netgone
+echo [%date% %time%] no network after 30 min, Office offline activation only >> "%LOG%"
+
+:dorun
+REM --- 3) MAS unattended: any switch selects unattended mode (no menu, no keypress). ---
+REM     HWID and Ohook run as TWO separate calls so neither one gets skipped:
+REM       /HWID  = Windows digital license (needs network)
+REM       /Ohook = Office permanent activation (works offline)
+if %ONLINE% equ 1 call "C:\MAS\MAS_AIO.cmd" /HWID /S >> "%LOG%" 2>&1
+if %ONLINE% equ 1 set HWIDCODE=!errorlevel!
+call "C:\MAS\MAS_AIO.cmd" /Ohook /S >> "%LOG%" 2>&1
+set OHOOKCODE=!errorlevel!
+echo [%date% %time%] MAS exit: HWID=!HWIDCODE! OHOOK=!OHOOKCODE! >> "%LOG%"
+
+REM --- 4) Double check the real Windows license state via WMI (no GUI, no popup) ---
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance SoftwareLicensingProduct -Filter 'PartialProductKey IS NOT NULL AND LicenseStatus = 1' -ErrorAction SilentlyContinue | Select-Object -First 1; if ($p) { '1' } else { '0' }" > "%TEMP%\wl.txt" 2>&1
+findstr /r /x /c:"1" "%TEMP%\wl.txt" >nul 2>&1
+if not errorlevel 1 set WIN_LICENSE=1
+findstr /r /x /c:"0" "%TEMP%\wl.txt" >nul 2>&1
+if not errorlevel 1 set WIN_LICENSE=0
+
+REM --- 5) Result marker read by FirstBoot.ps1 ---
+if %ONLINE% equ 1 goto resonline
+echo NETWORK=OFFLINE> "%RES%"
+goto resdone
+:resonline
+echo NETWORK=OK> "%RES%"
+:resdone
+echo HWID_EXIT=!HWIDCODE!>> "%RES%"
+echo OHOOK_EXIT=!OHOOKCODE!>> "%RES%"
+echo WIN_LICENSE=!WIN_LICENSE!>> "%RES%"
+echo DONE>> "%RES%"
+echo [%date% %time%] activator finished, WIN_LICENSE=!WIN_LICENSE! >> "%LOG%"
+endlocal
+exit /b 0
+
+'@
+        # Ascii 写出：Activate.cmd 里全是英文注释，杜绝编码歧义
+        Set-Content -LiteralPath $activateCmd -Value $activateContent -Encoding Ascii
+
         $firstBootPs1 = Join-Path $firstBootDir 'FirstBoot.ps1'
         $firstBootContent = @'
-# SYSTEM-Intel-MIC FirstBoot Orchestrator
-# 功能：显示"正在安装 Office，请勿关机"窗口，等待 Office 安装完成后激活 Windows/Office，
-#       显示 SYSTEM-Intel-MIC 构建信息 + B 站主页。
+# SYSTEM-Intel-MIC FirstBoot Orchestrator（普通用户会话，RunOnce 触发）
+# 只做三件事：
+#   1) 显示"正在安装 Office / 正在激活"的进度窗口；
+#   2) 等 Office 装完（需要时补拉一次 setup.exe）；
+#   3) 读后台激活器写的结果标记，把"激活成功/失败"显示出来。
+# 真正跑 MAS 的是 SetupComplete 起的 SYSTEM 后台进程 Activate.cmd ——
+# 这里**不碰** MAS，避免普通用户权限不足、没联网、Office 还没装完这三种坑。
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
 # --- RunOnce 自删除（只执行一次）---
 reg delete "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" /v SYSTEM_Intel_MIC_FirstBoot /f 2>&1 | Out-Null
 
-# --- 顶级置顶窗口（不可关闭，始终在最前）---
+# --- 顶级置顶窗口（始终在最前，可手动关闭）---
 $win = New-Object System.Windows.Window
 $win.Title = "SYSTEM-Intel-MIC 优化版 Windows 11"
-$win.Width = 500; $win.Height = 320
+$win.Width = 540; $win.Height = 380
 $win.WindowStartupLocation = 'CenterScreen'
 $win.Topmost = $true
 $win.ResizeMode = 'NoResize'
@@ -823,7 +1183,7 @@ $status.Margin = '0,0,0,8'
 $stack.Children.Add($status)
 
 $info = New-Object System.Windows.Controls.TextBlock
-$info.Text = "• 由 SYSTEM-Intel-MIC 构建`r`n• 优化项：移除 AI/Copilot/Recall/遥测/诊断/反馈/预装垃圾`r`n• 保留：媒体播放器/Edge/商店/照片/相机`r`n• B站主页：https://space.bilibili.com/1978487514"
+$info.Text = "• 由 SYSTEM-Intel-MIC 构建`r`n• 已移除：AI/Copilot/Recall/Teams/Outlook/OneDrive/Xbox/纸牌/资讯/手机连接/获取帮助`r`n• 已禁用：自动更新（含 OOBE）/遥测/广告/推送安装`r`n• 保留：记事本/PowerShell/画图/计算器/Edge/商店/照片/相机/媒体播放器`r`n• B站主页：https://space.bilibili.com/1978487514"
 $info.TextWrapping = 'Wrap'
 $info.FontSize = 12
 $info.Foreground = [System.Windows.Media.Brushes]::Gray
@@ -837,7 +1197,7 @@ $updateStatus = {
     $status.Dispatcher.Invoke([Action]{ $status.Text = $msg })
 }
 
-# --- 1. 等待 Office 安装完成（SetupComplete.cmd 已用 SYSTEM 权限启动，这里只等待）---
+# --- 1. 等待 Office 安装完成（SetupComplete 已用 SYSTEM 启动，这里只等待/补拉）---
 $officeExe = 'C:\OfficeInstall\setup.exe'
 $officeConf = 'C:\OfficeInstall\configuration.xml'
 function Get-OfficeSetupRunning {
@@ -891,19 +1251,66 @@ if ((Test-Path -LiteralPath $officeRoot) -and -not (Get-OfficeSetupRunning)) {
     }
 }
 
-# --- 2. MAS 激活 Windows + Office ---
-& $updateStatus "正在激活 Windows + Office..."
-$masExe = 'C:\MAS\MAS_AIO.cmd'
-if (Test-Path -LiteralPath $masExe) {
-    Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$masExe`"" -Wait -NoNewWindow | Out-Null
+# --- 1.9 通知后台激活器：Office 这一步已经结束（装完/没装/失败都算结束）---
+# 后台 Activate.cmd 只认这个标记，避免它在那儿盲等一个根本没起来的 setup.exe。
+$officeState = if (-not (Test-Path -LiteralPath $officeRoot)) { 'SKIP' }
+               elseif (-not (Get-OfficeSetupRunning)) { 'DONE' } else { 'TIMEOUT' }
+Set-Content -LiteralPath 'C:\FirstBoot\OFFICE_DONE' -Value "$officeState $(Get-Date -Format s)" -Encoding Ascii
+
+# --- 2. 等后台激活器（Activate.cmd）写结果标记 ---
+# 它会先等 Office 装完、再等联网，然后用无人值守模式跑 MAS（/HWID /Ohook /S）。
+$resultFile = 'C:\FirstBoot\ACTIVATION_RESULT.txt'
+$deadline = (Get-Date).AddMinutes(60)
+while (-not (Test-Path -LiteralPath $resultFile) -and (Get-Date) -lt $deadline) {
+    & $updateStatus "正在激活 Windows + Office（等待联网并运行 MAS，无需操作）..."
+    Start-Sleep -Seconds 10
 }
 
-# --- 3. 完成 ---
-& $updateStatus "✅ 全部完成！Windows + Office 已激活，Office 已安装"
-Start-Sleep -Seconds 3
+# --- 3. 显示激活结果 ---
+function Get-ResValue([object[]] $Lines, [string] $Key) {
+    $hit = $Lines | Where-Object { $_ -like "$Key=*" } | Select-Object -First 1
+    if ($hit) { return ($hit -replace [regex]::Escape("$Key="), '') }
+    return $null
+}
+$verdict = ''
+$tail = ''
+if (Test-Path -LiteralPath $resultFile) {
+    $raw = @(Get-Content -LiteralPath $resultFile -ErrorAction SilentlyContinue)
+    $net  = Get-ResValue $raw 'NETWORK'
+    $hwid = Get-ResValue $raw 'HWID_EXIT'
+    $ohk  = Get-ResValue $raw 'OHOOK_EXIT'
+    $logF = 'C:\FirstBoot\activation.log'
+    if (Test-Path -LiteralPath $logF) { $tail = ((Get-Content -LiteralPath $logF -Tail 8) -join "`r`n") }
+    # Windows 以真实授权状态为准（WIN_LICENSE=1 表示已授权），拿不到再退回退出码
+    $lic = Get-ResValue $raw 'WIN_LICENSE'
+    $winOk  = if ($lic -eq '1') { $true } elseif ($lic -eq '0') { $false } else { ($hwid -eq '0') }
+    $offOk  = ($ohk -eq '0')
+    $netTxt = if ($net -eq 'OFFLINE') { '离线：仅跑了 Office 离线激活，联网后可再点一次 C:\MAS\MAS_AIO.cmd 激活 Windows' }
+              else { '已联网' }
+    if ($winOk -and $offOk) {
+        $verdict = "✅ 激活完成（$netTxt）`r`nWindows 已激活，Office (Word/Excel/PowerPoint) 已激活。"
+    } else {
+        $parts = @()
+        if ($winOk) { $parts += 'Windows ✅ 已激活' } else { $parts += "Windows ⚠ 返回码 $hwid" }
+        if ($offOk) { $parts += 'Office ✅ 已激活' } else { $parts += "Office ⚠ 返回码 $ohk" }
+        $verdict = "⚠ 激活部分完成（$netTxt）`r`n" + ($parts -join "`r`n") + "`r`n可手动双击运行 C:\MAS\MAS_AIO.cmd 重试。"
+    }
+} else {
+    $verdict = "⚠ 未等到激活结果（可能联网较慢或激活器被占用）。`r`n可手动双击运行 C:\MAS\MAS_AIO.cmd 重试。"
+}
+
+& $updateStatus $verdict
+if ($tail) {
+    $info.Text = "• 由 SYSTEM-Intel-MIC 构建`r`n• 激活日志尾部：`r`n$tail"
+}
+# 停留一会儿让用户看得到结果，也能随时手动关掉
+Start-Sleep -Seconds 20
 $win.Dispatcher.Invoke([Action]{ $win.Close() })
 '@
-        Set-Content -LiteralPath $firstBootPs1 -Value $firstBootContent -Encoding Utf8
+        # utf8BOM：FirstBoot.ps1 由 RunOnce 里的 Windows PowerShell 5.1 执行，
+        # 无 BOM 的 UTF-8 会被 5.1 当成 ANSI 解码，中文会变乱码
+        Set-Content -LiteralPath $firstBootPs1 -Value $firstBootContent -Encoding UTF8BOM
+
 
         # ---- 6. 如果需要，下载 Office ODT + MAS ----
         if ($OfficeOffline -or $MasActivate) {
