@@ -1082,12 +1082,26 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
         $setupCompleteContent = @'
 @echo off
 REM ===== SYSTEM-Intel-MIC SetupComplete (runs as SYSTEM, right before first logon) =====
-REM 1) Register ONSTART scheduled task that runs Activate.cmd - survives a reboot.
-REM    Online cleanup (Getstarted / WindowsBackup / OneDrive / SecHealthUI) + Office
-REM    install + MAS activation are all owned by that single task.
-REM 2) Register RunOnce so FirstBoot.ps1 shows a progress window at first logon.
+REM 1) Register the ONLOGON cleanup task and start it right away.
+REM    Getstarted / WindowsBackup / SecHealthUI / OneDrive are staged packages that only
+REM    register at the FIRST interactive logon, so Cleanup.ps1 does the logon independent
+REM    work now and then waits for that logon before removing the apps.
+REM 2) Register ONSTART scheduled task that runs Activate.cmd - survives a reboot.
+REM    Office install + MAS activation are all owned by that single task.
+REM 3) Register RunOnce so FirstBoot.ps1 shows a progress window at first logon.
 REM NOTE: this file is written as ASCII on purpose (cmd.exe cannot read UTF-8), so
 REM       every comment below must stay ASCII-only.
+
+if exist "C:\FirstBoot\Cleanup.ps1" (
+    echo [SYSTEM-Intel-MIC] Registering online cleanup task...
+    schtasks /Create /TN "SYSTEM_Intel_MIC_Cleanup" /TR "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\FirstBoot\Cleanup.ps1" /SC ONLOGON /RU SYSTEM /RL HIGHEST /F
+    echo [SYSTEM-Intel-MIC] Starting online cleanup now (it waits for the first logon)...
+    schtasks /Run /TN "SYSTEM_Intel_MIC_Cleanup"
+    if errorlevel 1 (
+        echo [SYSTEM-Intel-MIC] schtasks /Run failed, falling back to plain start
+        start "" /B powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\FirstBoot\Cleanup.ps1
+    )
+)
 
 if exist "C:\FirstBoot\Activate.cmd" (
     echo [SYSTEM-Intel-MIC] Registering activator scheduled task...
@@ -1117,20 +1131,93 @@ exit /b 0
         # 它是系统应用，只能在系统跑起来以后、以 SYSTEM 身份在线删。
         $cleanupPs1 = Join-Path $firstBootDir 'Cleanup.ps1'
         $cleanupContent = @'
-# SYSTEM-Intel-MIC 在线清理（SYSTEM 身份，由计划任务 SYSTEM_Intel_MIC_Activate 的
-# 第一步调用；幂等，跑完写 CLEANUP_DONE 标记，之后每次开机都会跳过）。
-# 目标：卸掉「入门」「Windows 备份」「OneDrive」「Windows 安全中心(Defender)」，
-#       并补删离线阶段因为 Tasks 目录还没生成而删掉的更新/遥测计划任务。
+# SYSTEM-Intel-MIC 装机后在线清理（SYSTEM 身份）
+#
+# 唯一属主：计划任务 SYSTEM_Intel_MIC_Cleanup（ONLOGON / SYSTEM）。
+#   SetupComplete.cmd 注册这个任务以后立刻 schtasks /Run 一次，所以：
+#     * SetupComplete 跑在首登之前 → 任务在后台先做与登录无关的部分，等第一个用户
+#       真正登录后再删 Appx（并把启动器、计划任务的活一次干完）；
+#     * SetupComplete 已经跑在首登之后 → 立刻就做；
+#     * 万一 /Run 失败，ONLOGON 触发器在首次登录时还会再拉起一次（有实例锁互斥）。
+#
+# 为什么必须等首次登录：「入门 Getstarted / Windows 备份 WindowsBackup /
+# Windows 安全中心 SecHealthUI / OneDrive」在离线 provisioned 列表里一条都 grep 不到，
+# 它们是**随首登才注册的 staged 包**，没登录之前根本不存在。装机时没看见就打勾，
+# 之后就再也不会重跑了 —— 所以 CLEANUP_DONE 只有在「确认见过交互式登录」之后才写。
+#
+# 幂等：CLEANUP_DONE 写好以后本脚本直接退出，并自我删除计划任务。
 $ErrorActionPreference = 'SilentlyContinue'
-$base = 'C:\FirstBoot'
+$base       = 'C:\FirstBoot'
 $doneMarker = Join-Path $base 'CLEANUP_DONE'
-$log = Join-Path $base 'cleanup.log'
+$log        = Join-Path $base 'cleanup.log'
+$lock       = Join-Path $base 'cleanup.lock'
+
+# 要删的目标包名（-like 包含式匹配）
+$targetNames = @(
+    'Getstarted',        # 入门
+    'WindowsBackup',     # Windows 备份
+    'SecHealthUI',       # Windows 安全中心（Defender UI）
+    'OneDriveSync',      # OneDrive 同步壳（若以 appx 形式存在）
+    'GetHelp', 'MSTeams', 'OutlookForWindows', 'BingNews'   # 兜底：万一商店又推回来
+)
+
 function L([string] $m) {
     Add-Content -LiteralPath $log -Value ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m) -Encoding UTF8
 }
+function Touch-Lock {
+    # 每轮刷新锁文件时间戳，防止「等着登录」期间被另一个实例判定成死锁
+    # 注意是 (Get-Date).Ticks —— Get-Date 没有 -Ticks 参数
+    Set-Content -LiteralPath $lock -Value ((Get-Date).Ticks) -Encoding Ascii
+}
+function Remove-TargetAppx {
+    foreach ($p in @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue)) {
+        foreach ($n in $targetNames) {
+            if ($p.DisplayName -like "*$n*") {
+                $r = Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -ErrorAction SilentlyContinue
+                if ($r -ne $null) { L "provisioned removed: $($p.DisplayName)" } else { L "provisioned fail: $($p.DisplayName)" }
+                break
+            }
+        }
+    }
+    foreach ($p in @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)) {
+        foreach ($n in $targetNames) {
+            if ($p.Name -like "*$n*") {
+                try {
+                    Remove-AppxPackage -Package $p.PackageFullName -AllUsers -ErrorAction Stop | Out-Null
+                    L "appx removed (AllUsers): $($p.Name)"
+                } catch { L "appx fail: $($p.Name) -> $_" }
+                break
+            }
+        }
+    }
+}
+function Test-TargetLeft {
+    $left = @()
+    foreach ($p in @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue)) {
+        foreach ($n in $targetNames) { if ($p.DisplayName -like "*$n*") { $left += $p.DisplayName; break } }
+    }
+    foreach ($p in @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)) {
+        foreach ($n in $targetNames) { if ($p.Name -like "*$n*") { $left += $p.Name; break } }
+    }
+    return $left
+}
+
 L '=== online cleanup start ==='
+if (Test-Path -LiteralPath $doneMarker) { L 'CLEANUP_DONE already exists, exit'; exit 0 }
+
+# --- 0. 单实例锁（ONLOGON 触发器与 SetupComplete 的 /Run 可能撞车）---
+$gotLock = $false
+if (Test-Path -LiteralPath $lock) {
+    $age = (Get-Date) - (Get-Item -LiteralPath $lock -ErrorAction SilentlyContinue).LastWriteTime
+    if ($age.TotalMinutes -lt 15) { L 'another cleanup instance holds the lock, exit'; exit 0 }
+    Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
+}
+try { New-Item -ItemType File -Path $lock -ErrorAction Stop | Out-Null; $gotLock = $true }
+catch { L 'could not acquire the lock, exit'; exit 0 }
+Touch-Lock
 
 # --- 1. 先把 Defender 关掉（服务 + 篡改保护），否则 SecHealthUI 删了会被它自己装回来 ---
+#     这步与「有没有登录」无关，立刻做
 foreach ($svc in @('SecurityHealthService', 'WdNisSvc', 'WinDefend', 'Sense')) {
     try {
         Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
@@ -1143,46 +1230,15 @@ foreach ($k in @(
     'HKLM:\SOFTWARE\Microsoft\Windows Defender\Features',
     'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender',
     'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection')) {
-    try {
-        if (-not (Test-Path $k)) { New-Item $k -Force | Out-Null }
-    } catch { }
+    try { if (-not (Test-Path $k)) { New-Item $k -Force | Out-Null } } catch { }
 }
 try { Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows Defender\Features' -Name 'TamperProtection' -Value 0 -Type DWord } catch { L "TamperProtection write fail: $_" }
-foreach ($n in @('DisableAntiSpyware','DisableAntiVirus')) {
+foreach ($n in @('DisableAntiSpyware', 'DisableAntiVirus')) {
     try { Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender' -Name $n -Value 1 -Type DWord } catch { }
 }
 try { Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection' -Name 'DisableRealtimeMonitoring' -Value 1 -Type DWord } catch { }
 
-# --- 2. 卸掉点名要删的 Appx（provisioned + 已装到用户身上，两处都清）---
-$killNames = @(
-    'Getstarted',        # 入门
-    'WindowsBackup',     # Windows 备份
-    'SecHealthUI',       # Windows 安全中心（Defender UI）
-    'OneDriveSync',      # OneDrive 同步壳（若以 appx 形式存在）
-    'GetHelp', 'MSTeams', 'OutlookForWindows', 'BingNews'   # 兜底：万一商店又推回来
-)
-foreach ($p in @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue)) {
-    foreach ($n in $killNames) {
-        if ($p.DisplayName -like "*$n*") {
-            $r = Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -ErrorAction SilentlyContinue
-            if ($r -ne $null) { L "provisioned removed: $($p.DisplayName)" } else { L "provisioned fail: $($p.DisplayName)" }
-            break
-        }
-    }
-}
-foreach ($p in @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)) {
-    foreach ($n in $killNames) {
-        if ($p.Name -like "*$n*") {
-            try {
-                Remove-AppxPackage -Package $p.PackageFullName -AllUsers -ErrorAction Stop | Out-Null
-                L "appx removed (AllUsers): $($p.Name)"
-            } catch { L "appx fail: $($p.Name) -> $_" }
-            break
-        }
-    }
-}
-
-# --- 3. OneDrive：跑官方卸载器 + 清残留 + 删 Run 触发值 ---
+# --- 2. OneDrive：跑官方卸载器 + 清残留 + 删 Run 触发值（与登录无关）---
 foreach ($setup in @("$env:windir\System32\OneDriveSetup.exe",
                      "$env:windir\SysWOW64\OneDriveSetup.exe")) {
     if (Test-Path -LiteralPath $setup) {
@@ -1198,8 +1254,7 @@ foreach ($proc in @('OneDrive', 'OneDriveStandaloneUpdater', 'OneDriveSetup')) {
 foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
                  'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run')) {
     try {
-        $props = (Get-Item -Path $k -ErrorAction SilentlyContinue).GetValueNames()
-        foreach ($pn in $props) {
+        foreach ($pn in @((Get-Item -Path $k -ErrorAction SilentlyContinue).GetValueNames())) {
             $v = (Get-ItemProperty -Path $k -Name $pn -ErrorAction SilentlyContinue).$pn
             if ("$v" -like '*OneDrive*') {
                 Remove-ItemProperty -Path $k -Name $pn -Force -ErrorAction SilentlyContinue
@@ -1208,13 +1263,15 @@ foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
         }
     } catch { L "Run sweep fail: $k $_" }
 }
-foreach ($odDir in @(($(Get-ChildItem -Path 'C:\Users' -Directory -ErrorAction SilentlyContinue |
-                         ForEach-Object { Join-Path $_.FullName 'AppData\Local\Microsoft OneDrive' })),
-                     "$env:LOCALAPPDATA\Microsoft OneDrive",
-                     "$env:LOCALAPPDATA\OneDrive",
-                     'C:\Program Files\Microsoft OneDrive',
-                     'C:\Program Files (x86)\Microsoft OneDrive',
-                     'C:\OneDriveTemp')) {
+$userOneDriveDirs = @(Get-ChildItem -Path 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+    ForEach-Object { Join-Path $_.FullName 'AppData\Local\Microsoft OneDrive' })
+$odDirs = @($userOneDriveDirs) + @(
+    "$env:LOCALAPPDATA\Microsoft OneDrive",
+    "$env:LOCALAPPDATA\OneDrive",
+    'C:\Program Files\Microsoft OneDrive',
+    'C:\Program Files (x86)\Microsoft OneDrive',
+    'C:\OneDriveTemp')
+foreach ($odDir in $odDirs) {
     if ($odDir -and (Test-Path -LiteralPath $odDir)) {
         & takeown.exe /F $odDir /R /D Y 2>&1 | Out-Null
         & icacls.exe $odDir /grant '*S-1-5-32-545:(OI)(CI)F' /T /C 2>&1 | Out-Null
@@ -1223,8 +1280,8 @@ foreach ($odDir in @(($(Get-ChildItem -Path 'C:\Users' -Directory -ErrorAction S
     }
 }
 
-# --- 4. 补删更新/遥测计划任务（离线时 Tasks 目录还没生成，4c 那步一条都没删到）---
-$tns = @(
+# --- 3. 补删更新/遥测计划任务（离线时 Tasks 目录还没生成，4c 那步一条都没删到）---
+foreach ($t in @(
     '\Microsoft\Windows\WindowsUpdate\Scheduled Start',
     '\Microsoft\Windows\WindowsUpdate\Orchestrator\USO_UxBroker',
     '\Microsoft\Windows\WindowsUpdate\Orchestrator\UpdateOrchestrator',
@@ -1236,16 +1293,55 @@ $tns = @(
     '\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip',
     '\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser',
     '\Microsoft\Windows\Application Experience\ProgramDataUpdater',
-    '\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector'
-)
-foreach ($t in $tns) {
-    $out = & schtasks.exe /Delete /TN $t /F 2>&1 | Out-String
+    '\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector')) {
+    & schtasks.exe /Delete /TN $t /F 2>&1 | Out-Null
     if ($LASTEXITCODE -eq 0) { L "task deleted: $t" }
 }
 
-# --- 5. 收尾：写完成标记（Activate.cmd 只在没有这个标记时才会重跑本脚本）---
-L '=== online cleanup finished ==='
+# --- 4. 等待第一次交互式登录（最多 45 分钟）---
+#     staged 包只在这一刻注册，不等就永远删不到。
+#     判据 = 存在真实用户配置文件 **且** 桌面 shell 已经起来
+#     （不能只看登录会话：欢迎界面阶段也会有 LogonType=2 的会话，会误判）。
+#     每轮刷新锁文件时间戳，避免「等着登录」期间被别的实例当成死锁。
+$usersExclude = @('Default', 'Default User', 'DefaultUser', 'Public', 'All Users')
+$logonSeen = $false
+for ($i = 0; $i -lt 270; $i++) {
+    Touch-Lock
+    $ud = @(Get-ChildItem -Path 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $usersExclude -notcontains $_.Name })
+    $ex = @(Get-Process -Name explorer -ErrorAction SilentlyContinue)
+    if ($ud.Count -gt 0 -and $ex.Count -gt 0) {
+        $logonSeen = $true
+        L "interactive logon detected (profile: $($ud[0].Name))"
+        break
+    }
+    Start-Sleep -Seconds 10
+}
+if (-not $logonSeen) { L 'no interactive logon within 45 minutes, Appx pass will be retried by the ONLOGON task' }
+
+# --- 5. 删点名要删的 Appx（登录后才存在），最多再补刀 10 分钟 ---
+if ($logonSeen) { Start-Sleep -Seconds 60 }   # 给 staged 包注册留时间
+Remove-TargetAppx
+if ($logonSeen) {
+    for ($i = 1; $i -le 10; $i++) {
+        $left = @(Test-TargetLeft)
+        if ($left.Count -eq 0) { L 'target packages are all gone'; break }
+        L "still present ($($left -join ', ')), retry $i/10 in 60s..."
+        Start-Sleep -Seconds 60
+        Touch-Lock
+        Remove-TargetAppx
+    }
+}
+
+# --- 6. 收尾：释放锁；只有「确认见过登录」才写完成标记并自我删除任务 ---
+Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
+if (-not $logonSeen) {
+    L '=== no logon seen -> CLEANUP_DONE NOT written, ONLOGON task left in place ==='
+    exit 0
+}
 Set-Content -LiteralPath $doneMarker -Value (Get-Date -Format s) -Encoding Ascii
+schtasks.exe /Delete /TN 'SYSTEM_Intel_MIC_Cleanup' /F 2>&1 | Out-Null
+L '=== online cleanup finished: CLEANUP_DONE written, task self-deleted ==='
 '@
         # UTF8BOM：由 Windows PowerShell 5.1 执行，无 BOM 的 UTF-8 会被当成 ANSI 解码
         Set-Content -LiteralPath $cleanupPs1 -Value $cleanupContent -Encoding UTF8BOM
@@ -1264,9 +1360,10 @@ Set-Content -LiteralPath $doneMarker -Value (Get-Date -Format s) -Encoding Ascii
         $activateContent = @'
 REM ===== SYSTEM-Intel-MIC Activate (SYSTEM, task SYSTEM_Intel_MIC_Activate) =====
 REM 0) already finished -> delete own task and exit
-REM 1) online cleanup (Getstarted / WindowsBackup / OneDrive / SecHealthUI) if not done yet
-REM 2) Office install - (re)launch setup.exe, survives a reboot
-REM 3) wait for network -> MAS unattended (/HWID + /Ohook) -> write result marker
+REM 1) Office install - (re)launch setup.exe, survives a reboot
+REM 2) wait for network -> MAS unattended (/HWID + /Ohook) -> write result marker
+REM NOTE: the online cleanup (Getstarted / WindowsBackup / OneDrive / SecHealthUI) is
+REM       owned by task SYSTEM_Intel_MIC_Cleanup (ONLOGON), NOT by this script.
 setlocal enabledelayedexpansion
 set LOG=C:\FirstBoot\activation.log
 set RES=C:\FirstBoot\ACTIVATION_RESULT.txt
@@ -1281,15 +1378,7 @@ set OFFICE=SKIP
 if exist "%RES%" goto selfdelete
 echo [%date% %time%] activator start >> "%LOG%"
 
-REM --- 1) online cleanup (idempotent; skipped once CLEANUP_DONE exists) ---
-if not exist "C:\FirstBoot\CLEANUP_DONE" (
-    if exist "C:\FirstBoot\Cleanup.ps1" (
-        echo [%date% %time%] running online cleanup >> "%LOG%"
-        powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File "C:\FirstBoot\Cleanup.ps1" >> "%LOG%" 2>&1
-    )
-)
-
-REM --- 2) Office install: check install state first, launch setup when idle ---
+REM --- 1) Office install: check install state first, launch setup when idle ---
 :office
 if exist "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE" goto officeok
 if exist "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE" goto officeok
@@ -1313,9 +1402,11 @@ goto officedone
 :officetimeout
 echo [%date% %time%] Office install timed out after 90 min >> "%LOG%"
 :officedone
-if not exist "C:\FirstBoot\OFFICE_DONE" echo %OFFICE% %date% %time% > "C:\FirstBoot\OFFICE_DONE"
+if exist "C:\FirstBoot\OFFICE_DONE" goto officemarked
+echo %OFFICE% %date% %time% > "C:\FirstBoot\OFFICE_DONE"
+:officemarked
 
-REM --- 3) wait for network (26100+ HWID/TSforge needs it), max 30 min ---
+REM --- 2) wait for network (26100+ HWID/TSforge needs it), max 30 min ---
 set WAITED=0
 :waitnet
 ping -n 1 -w 2000 223.5.5.5 >nul 2>&1
@@ -1334,7 +1425,7 @@ goto dorun
 echo [%date% %time%] no network after 30 min, Office offline activation only >> "%LOG%"
 
 :dorun
-REM --- 4) MAS unattended: any switch selects unattended mode (no menu, no keypress). ---
+REM --- 3) MAS unattended: any switch selects unattended mode (no menu, no keypress). ---
 REM     HWID and Ohook run as TWO separate calls so neither one gets skipped:
 REM       /HWID  = Windows digital license (needs network)
 REM       /Ohook = Office permanent activation (works offline)
@@ -1344,14 +1435,14 @@ call "C:\MAS\MAS_AIO.cmd" /Ohook /S >> "%LOG%" 2>&1
 set OHOOKCODE=!errorlevel!
 echo [%date% %time%] MAS exit: HWID=!HWIDCODE! OHOOK=!OHOOKCODE! >> "%LOG%"
 
-REM --- 5) Double check the real Windows license state via WMI (no GUI, no popup) ---
+REM --- 4) Double check the real Windows license state via WMI (no GUI, no popup) ---
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance SoftwareLicensingProduct -Filter 'PartialProductKey IS NOT NULL AND LicenseStatus = 1' -ErrorAction SilentlyContinue | Select-Object -First 1; if ($p) { '1' } else { '0' }" > "%TEMP%\wl.txt" 2>&1
 findstr /r /x /c:"1" "%TEMP%\wl.txt" >nul 2>&1
 if not errorlevel 1 set WIN_LICENSE=1
 findstr /r /x /c:"0" "%TEMP%\wl.txt" >nul 2>&1
 if not errorlevel 1 set WIN_LICENSE=0
 
-REM --- 6) prune the ~3.6 GB offline Office source, but only when Office really landed ---
+REM --- 5) prune the ~3.6 GB offline Office source, but only when Office really landed ---
 if not "%OFFICE%" == "OK" goto reswrite
 if not exist "C:\OfficeInstall\setup.exe" goto reswrite
 ping -n 21 127.0.0.1 >nul
@@ -1360,7 +1451,7 @@ if exist "C:\OfficeInstall" echo [%date% %time%] OfficeInstall prune failed >> "
 if not exist "C:\OfficeInstall" echo [%date% %time%] OfficeInstall pruned, freed 3.6 GB >> "%LOG%"
 
 :reswrite
-REM --- 7) Result marker read by FirstBoot.ps1 ---
+REM --- 6) Result marker read by FirstBoot.ps1 ---
 if %ONLINE% equ 1 goto resonline
 echo NETWORK=OFFLINE> "%RES%"
 goto resdone
