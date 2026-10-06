@@ -484,7 +484,7 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
 
             # ---- 编解码器（缺了 WebP/HEIF/AV1/HEVC 的视频和图片就打不开）----
             'WebMediaExtensions', 'VP9VideoExtensions', 'HEIFImageExtension',
-            'AV1VideoExtensions', 'MPEG2VideoExtensions', 'HEVCVideoExtension',
+            'AV1VideoExtension', 'MPEG2VideoExtension', 'HEVCVideoExtension',
             'AVCEncoderVideoExtension', 'RawImageExtension', 'WebpImageExtension',
             'Codec',
 
@@ -551,19 +551,10 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
         }
 
         # ---- 1b. 系统级移除 OneDrive ----
-        # OneDrive 在 Win11 里不是 provisioned 包，而是 System32\SysWOW64 下的
+        # OneDrive 在 Win11 里不是 provisioned 包，而是 System32/SysWOW64 下的
         # OneDriveSetup.exe + 注册表 Run 键，首次登录会自动把它装回来。
-        # 三样一起清掉才干净；删不掉只警告，不影响构建。
-        foreach ($odExe in @('Windows\System32\OneDriveSetup.exe',
-                             'Windows\SysWOW64\OneDriveSetup.exe')) {
-            $odFull = Join-Path $mnt $odExe
-            if (Test-Path -LiteralPath $odFull) {
-                try { Remove-Item -LiteralPath $odFull -Force -ErrorAction Stop
-                      Write-Info "已删除 $odExe" }
-                catch { Write-Warning "删除 $odExe 失败: $_" }
-            }
-        }
-        # 卸载已解包的 OneDrive 文件（装机前镜像里通常还没有）
+        # 文件删除常因 ACL 被拒，**改为只删注册表 Run 值**（已在 SOFTWARE hive 段配合 Type='Delete' 处理），
+        # 再尽力删 Program Files 下的已解包目录（通常不存在）。
         foreach ($odDir in @('Program Files\Microsoft OneDrive',
                              'Program Files (x86)\Microsoft OneDrive')) {
             $odFull = Join-Path $mnt $odDir
@@ -939,6 +930,33 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
             }
         }
 
+        # ---- 4c. 删掉会自己跑更新的计划任务 ----
+        # 策略（NoAutoUpdate）只管"Windows Update 主程序"，计划任务是另一条触发路径。
+        # 直接删 Tasks 目录下的任务文件即可，离线状态最省事，且只删更新/遥测类，
+        # 不碰磁盘整理、系统诊断、Defender 扫描这些正经任务。
+        $tasksDir = Join-Path $mnt 'Windows\System32\Tasks\Microsoft\Windows'
+        $taskFiles = @(
+            'WindowsUpdate\Scheduled Start',          # ⭐ 例行 Windows 更新（会自动下载安装）
+            'WindowsUpdate\Orchestrator\USO_UxBroker',# 更新编排器
+            'WindowsUpdate\Orchestrator\UpdateOrchestrator',
+            'Automatic App Update',                   # 商店应用自动更新
+            'Maps\MapsToastTask', 'Maps\MapsUpdateTask',
+            'Customer Experience Improvement Program\Consolidator',
+            'Customer Experience Improvement Program\UsbCeip',
+            'Application Experience\Microsoft Compatibility Appraiser',
+            'Application Experience\ProgramDataUpdater',
+            'DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector'
+        )
+        foreach ($t in $taskFiles) {
+            $tf = Join-Path $tasksDir $t
+            if (Test-Path -LiteralPath $tf) {
+                try {
+                    Remove-Item -LiteralPath $tf -Force -ErrorAction Stop
+                    Write-Info "已删除计划任务: $t"
+                } catch { Write-Warning "删除计划任务 $t 失败: $_" }
+            }
+        }
+
         # ---- 4b. DEFAULT 用户 hive：新用户首次登录的 HKCU 默认值 ----
         # Windows 新建账户时会拷贝 C:\Users\Default\NTUSER.DAT 当模板，
         # 所以下面写进去的值对**之后创建的每个账户**都生效。
@@ -992,33 +1010,6 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                 Write-Info "DEFAULT hive unload 结果: $LASTEXITCODE"
             } else {
                 Write-Warning "DEFAULT hive load 失败，跳过新用户默认值优化"
-            }
-        }
-
-        # ---- 4c. 删掉会自己跑更新的计划任务 ----
-        # 策略（NoAutoUpdate）只管"Windows Update 主程序"，计划任务是另一条触发路径。
-        # 直接删 Tasks 目录下的任务文件即可，离线状态最省事，且只删更新/遥测类，
-        # 不碰磁盘整理、系统诊断、Defender 扫描这些正经任务。
-        $tasksDir = Join-Path $mnt 'Windows\System32\Tasks\Microsoft\Windows'
-        $taskFiles = @(
-            'WindowsUpdate\Scheduled Start',          # ⭐ 例行 Windows 更新（会自动下载安装）
-            'WindowsUpdate\Orchestrator\USO_UxBroker',# 更新编排器
-            'WindowsUpdate\Orchestrator\UpdateOrchestrator',
-            'Automatic App Update',                   # 商店应用自动更新
-            'Maps\MapsToastTask', 'Maps\MapsUpdateTask',
-            'Customer Experience Improvement Program\Consolidator',
-            'Customer Experience Improvement Program\UsbCeip',
-            'Application Experience\Microsoft Compatibility Appraiser',
-            'Application Experience\ProgramDataUpdater',
-            'DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector'
-        )
-        foreach ($t in $taskFiles) {
-            $tf = Join-Path $tasksDir $t
-            if (Test-Path -LiteralPath $tf) {
-                try {
-                    Remove-Item -LiteralPath $tf -Force -ErrorAction Stop
-                    Write-Info "已删除计划任务: $t"
-                } catch { Write-Warning "删除计划任务 $t 失败: $_" }
             }
         }
 
