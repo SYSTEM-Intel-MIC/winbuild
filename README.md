@@ -597,17 +597,36 @@ load 失败只 `Write-Warning` 跳过，不影响构建。
 ## 装机后在线清理（`C:\FirstBoot\Cleanup.ps1`）
 
 离线挂载镜像时删不掉、或压根枚举不到的东西，全部挪到**装完系统、系统跑起来之后**
-以 SYSTEM 身份在线删。脚本镜像内的路径是 `C:\FirstBoot\Cleanup.ps1`，由**激活计划任务
-`SYSTEM_Intel_MIC_Activate` 的第一步**调用（单一属主，避免两处同时抢着跑），
-跑完写 `C:\FirstBoot\CLEANUP_DONE` 标记，之后每次开机会自动跳过；中途重启则下次开机会重跑。
-日志在 `C:\FirstBoot\cleanup.log`。
+以 SYSTEM 身份在线删。脚本镜像内的路径是 `C:\FirstBoot\Cleanup.ps1`。
+
+**唯一属主 = 计划任务 `SYSTEM_Intel_MIC_Cleanup`（`ONLOGON` / SYSTEM / `RL HIGHEST`）：**
+
+| 触发 | 时机 | 做什么 |
+|---|---|---|
+| `SetupComplete.cmd` 里 `schtasks /Create` + **`schtasks /Run`**（失败才降级 `start /B`） | OOBE 结束、第一次登录**之前** | 先做与登录无关的三件事（关 Defender、卸 OneDrive、删更新/遥测计划任务），然后**原地等待第一次交互式登录**（最多 45 分钟，每 10 秒刷新一次实例锁） |
+| `ONLOGON` 触发器（同一任务） | 第一个用户真正登录时 | 上面那个实例还在等 → 拿不到 15 分钟内的实例锁 → 直接让路；如果 `SetupComplete` 那次 `schtasks /Run` 压根没成功，这次就是兜底 |
+| 登录被检测到之后 | `explorer` 起来 + 60 秒宽限 | 删点名要删的 Appx，并**最多再补刀 10 分钟**（每 60 秒重查一次，直到目标包全部消失） |
+| 结束 | 见下 | 写 `C:\FirstBoot\CLEANUP_DONE` → **`schtasks /Delete` 自我删除任务**；日志 `C:\FirstBoot\cleanup.log` |
+
+> **为什么非要等登录**：`Getstarted` / `WindowsBackup` / `SecHealthUI` 在离线 provisioned
+> 列表里**一条都 grep 不到**（构建日志计数 0），它们是**随首登才注册的 staged 包** ——
+> 没登录之前系统里根本没有它们。所以 `CLEANUP_DONE` **只有在「确认见过交互式登录」之后
+> 才写**，否则就会变成「装机时什么都没看见 → 打个勾 → 之后再也不会重跑」，正是这次实机
+> 反馈 ④⑤⑥⑦ 一直删不掉的成因。
+> 判据用「真实用户配置文件 + `explorer.exe 已启动」，**不用** Win32_LogonSession ——
+> 欢迎界面阶段也会有 `LogonType=2` 会话，会把「还没输密码」误判成「已登录」。
 
 | # | 动作 | 为什么必须在线 |
 |---|---|---|
-| 1 | `Stop-Service` + `Set-Service -StartupType Disabled`：`SecurityHealthService` `WdNisSvc` `WinDefend` `Sense`；写 `TamperProtection=0`、`DisableAntiSpyware=1`、`DisableAntiVirus=1`、`DisableRealtimeMonitoring=1` | 篡改保护（Tamper Protection）在线会挡住策略写入并把服务拉回来，必须先在运行时关掉 |
-| 2 | `Get-AppxProvisionedPackage -Online` + `Get-AppxPackage -AllUsers` 里删 **`Getstarted`（入门）/ `WindowsBackup`（Windows 备份）/ `SecHealthUI`（Windows 安全中心）/ `OneDriveSync`**，外加 `GetHelp` `MSTeams` `OutlookForWindows` `BingNews` 兜底 | 这四个在离线的 provisioned 列表里 **grep 计数 = 0**（根本没注册成预置包），离线 `/Remove-ProvisionedAppxPackage` 无从下手；`SecHealthUI` 就算能匹配到，离线删也报 `0x80073CFA`（退出码 15610，日志里唯一的 `[fail]`）——它是系统应用，只能系统跑起来后以 SYSTEM 身份在线删 |
-| 3 | 跑 `OneDriveSetup.exe /uninstall`（System32 + SysWOW64），`Stop-Process` 掉 `OneDrive`/`OneDriveStandaloneUpdater`/`OneDriveSetup`，扫 `HKLM\...\Run` 和 `WOW6432Node\...\Run` 里所有含 `OneDrive` 的值删掉，`takeown` + `icacls` 后 `Remove-Item` 清残留目录（含 `C:\Users\*\AppData\Local\Microsoft OneDrive`） | 离线删 HKLM `Run` 两个键时日志「已删除注册表值」= 0 条（说明**真正的触发点不在 HKLM**），跑起来才能看到并清掉所有残留；OneDrive 是可执行程序（`OneDriveSetup.exe`），不是 Appx，只能跑它的官方卸载器 |
-| 4 | `schtasks /Delete /F` ⑧b 那张更新/遥测任务清单（12 个） | 同 ⑧b 的说明：离线 `System32\Tasks` 是空的，只能在线删 |
+| 1 | `Stop-Service` + `Set-Service -StartupType Disabled`：`SecurityHealthService` `WdNisSvc` `WinDefend` `Sense`；写 `TamperProtection=0`、`DisableAntiSpyware=1`、`DisableAntiVirus=1`、`DisableRealtimeMonitoring=1` | 篡改保护（Tamper Protection）在线会挡住策略写入并把服务拉回来，必须先在运行时关掉。这步**不等登录**，任务一启动就做 |
+| 2 | 跑 `OneDriveSetup.exe /uninstall`（System32 + SysWOW64），`Stop-Process` 掉 `OneDrive`/`OneDriveStandaloneUpdater`/`OneDriveSetup`，扫 `HKLM\...\Run` 和 `WOW6432Node\...\Run` 里所有含 `OneDrive` 的值删掉，`takeown` + `icacls` 后 `Remove-Item` 清残留目录（含 `C:\Users\*\AppData\Local\Microsoft OneDrive`） | 离线删 HKLM `Run` 两个键时日志「已删除注册表值」= 0 条（说明**真正的触发点不在 HKLM**），跑起来才能看到并清掉所有残留；OneDrive 是可执行程序（`OneDriveSetup.exe`），不是 Appx，只能跑它的官方卸载器。同样**不等登录** |
+| 3 | `schtasks /Delete /F` ⑧b 那张更新/遥测任务清单（12 个） | 同 ⑧b 的说明：离线 `System32\Tasks` 是空的，只能在线删。同样**不等登录** |
+| 4 | **等第一次交互式登录**（最多 45 分钟）→ `Get-AppxProvisionedPackage -Online` + `Get-AppxPackage -AllUsers` 里删 **`Getstarted`（入门）/ `WindowsBackup`（Windows 备份）/ `SecHealthUI`（Windows 安全中心）/ `OneDriveSync`**，外加 `GetHelp` `MSTeams` `OutlookForWindows` `BingNews` 兜底 → 最多再补刀 10 分钟 | 这四个在离线的 provisioned 列表里 **grep 计数 = 0**（根本没注册成预置包），离线 `/Remove-ProvisionedAppxPackage` 无从下手；`SecHealthUI` 就算能匹配到，离线删也报 `0x80073CFA`（退出码 15610，日志里唯一的 `[fail]`）——它是系统应用，只能系统跑起来后以 SYSTEM 身份在线删，而且**必须等到首登之后** |
+
+**实例锁 `C:\FirstBoot\cleanup.lock`**：`SetupComplete` 的 `/Run` 与 `ONLOGON` 触发可能撞车。
+- 拿不到锁且锁文件时间戳在 15 分钟内 → 直接退出，让正在跑的那个做完；
+- 等待登录期间每 10 秒刷新一次锁文件时间戳，**不会**被别人误判成死锁；
+- 锁超过 15 分钟（上一个实例崩了）→ 判定失效，接管重跑。
 
 **默认用户 hive 里额外删掉的 OneDrive 触发值**（离线做，见 ⑧a）：
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下的 `OneDriveSetup` / `OneDrive`。
@@ -659,21 +678,22 @@ load 失败只 `Write-Warning` 跳过，不影响构建。
 
 **执行顺序（`Activate.cmd`）：**
 
+> 在线清理**不归它管** —— 那是计划任务 `SYSTEM_Intel_MIC_Cleanup`（ONLOGON）的活，
+> 见上一节「装机后在线清理」。激活器只负责 Office + 联网 + MAS，两件事并行不打架。
+
 0. 已有 `C:\FirstBoot\ACTIVATION_RESULT.txt` → 直接 `schtasks /Delete` 自删任务并退出（幂等）
-1. **在线清理**：没有 `CLEANUP_DONE` 标记就跑 `Cleanup.ps1`（删入门 / Windows 备份 /
-   OneDrive / 安全中心 + 更新遥测计划任务，见上一节）
-2. **装 Office**：先看 `WINWORD.EXE` 在不在 → 不在且 `setup.exe` 空闲就拉起（最多试 5 次），
+1. **装 Office**：先看 `WINWORD.EXE` 在不在 → 不在且 `setup.exe` 空闲就拉起（最多试 5 次），
    每 15 秒一轮、上限 90 分钟；**不依赖任何别的进程写标记，重启后自动续装**
-3. **等联网**（`ping 223.5.5.5` / `114.114.114.114`），上限 30 分钟
-4. 分两次调用 MAS（**分开跑，免得只有一个方法被执行**）：
+2. **等联网**（`ping 223.5.5.5` / `114.114.114.114`），上限 30 分钟
+3. 分两次调用 MAS（**分开跑，免得只有一个方法被执行**）：
    - 联网时：`call MAS_AIO.cmd /HWID /S` → Windows 数字许可证永久激活
    - 始终执行：`call MAS_AIO.cmd /Ohook /S` → Office 永久激活（离线也能成）
    - **任意 switch 就进 unattended 模式**，不出菜单、不等按键（来源 massgrave.dev 官方开关文档）；
      必须用 `call` 才能跑完返回继续写结果
-5. 用 WMI 复核**真实授权状态**：`Get-CimInstance SoftwareLicensingProduct -Filter
+4. 用 WMI 复核**真实授权状态**：`Get-CimInstance SoftwareLicensingProduct -Filter
    'PartialProductKey IS NOT NULL AND LicenseStatus = 1'`（不出任何弹窗）
-6. `OFFICE=OK` 才删 `C:\OfficeInstall`
-7. 结果写 `C:\FirstBoot\ACTIVATION_RESULT.txt`（`NETWORK=` `OFFICE=` `HWID_EXIT=` `OHOOK_EXIT=`
+5. `OFFICE=OK` 才删 `C:\OfficeInstall`
+6. 结果写 `C:\FirstBoot\ACTIVATION_RESULT.txt`（`NETWORK=` `OFFICE=` `HWID_EXIT=` `OHOOK_EXIT=`
    `WIN_LICENSE=` `DONE`）+ `OFFICE_DONE`，完整输出留在 `C:\FirstBoot\activation.log`，
    最后 `schtasks /Delete /TN SYSTEM_Intel_MIC_Activate` **自我删除**
 
@@ -689,21 +709,37 @@ load 失败只 `Write-Warning` 跳过，不影响构建。
 
 ```
 SetupComplete.cmd（SYSTEM，OOBE 结束后）
+  ├─ schtasks /Create SYSTEM_Intel_MIC_Cleanup  /SC ONLOGON /RU SYSTEM /RL HIGHEST /F
+  │    └─ schtasks /Run  … → 立刻开跑（先做关 Defender / 卸 OneDrive / 删计划任务，
+  │                           然后在后台等第一次交互式登录，登录后再删 入门/备份/安全中心）
+  │                           /Run 失败才降级成 start /B
   ├─ schtasks /Create SYSTEM_Intel_MIC_Activate /SC ONSTART /RU SYSTEM /RL HIGHEST /F
-  ├─ schtasks /Run  … → 立刻跑一次（创建失败才降级成 start /B）
+  │    └─ schtasks /Run  … → 立刻跑一次（创建失败才降级成 start /B）
   └─ reg add HKLM\...\RunOnce\SYSTEM_Intel_MIC_FirstBoot   → 首次登录拉起 FirstBoot.ps1
+
+SYSTEM_Intel_MIC_Cleanup 计划任务（SYSTEM，ONLOGON；写完 CLEANUP_DONE 自我删除）
+  └─ C:\FirstBoot\Cleanup.ps1
+       ├─ 0) 有 CLEANUP_DONE → 直接退出
+       ├─ 1) 抢实例锁（拿不到且锁 <15 分钟 → 让路退出）
+       ├─ 2) 关 Defender 四个服务 + 篡改保护/策略键（不等登录）
+       ├─ 3) OneDriveSetup /uninstall + 清 HKLM Run + 删残留目录（不等登录）
+       ├─ 4) schtasks /Delete 更新·遥测计划任务 12 个（不等登录）
+       ├─ 5) 等第一次交互式登录（最多 45 分钟，每 10 秒刷新锁）
+       │      判据 = 真实用户配置文件 + explorer.exe 已启动
+       ├─ 6) 宽限 60 秒 → 删 Getstarted/WindowsBackup/SecHealthUI/… → 最多补刀 10 分钟
+       └─ 7) 确认见过登录才写 CLEANUP_DONE + schtasks /Delete 自删任务
+              没见过登录 → 不写标记、任务留着，下次登录的 ONLOGON 触发会再来一遍
 
 SYSTEM_Intel_MIC_Activate 计划任务（SYSTEM，ONSTART；跑完自我删除）
   └─ C:\FirstBoot\Activate.cmd
        ├─ 0) 已有 ACTIVATION_RESULT.txt → 直接 schtasks /Delete 自删，退出
-       ├─ 1) 没有 CLEANUP_DONE 就调 Cleanup.ps1（在线删入门/备份/OneDrive/安全中心 + 计划任务）
-       ├─ 2) Office：先看 WINWORD.EXE 装没装 → 没装且 setup.exe 空闲就拉起
+       ├─ 1) Office：先看 WINWORD.EXE 装没装 → 没装且 setup.exe 空闲就拉起
        │      （最多试 5 次 / 等 90 分钟；**重启后会自动接着装**）
-       ├─ 3) 等联网（ping 223.5.5.5 / 114.114.114.114，上限 30 分钟）
-       ├─ 4) MAS：联网才跑 /HWID（Windows），/Ohook 常跑（Office）
-       ├─ 5) 调 SoftwareLicensingProduct 拿真实 WIN_LICENSE（0/1）
-       ├─ 6) Office 装成了才 rmdir /s /q C:\OfficeInstall（约 3.6 GB）
-       └─ 7) 写 ACTIVATION_RESULT.txt（NETWORK / OFFICE / HWID_EXIT / OHOOK_EXIT / WIN_LICENSE / DONE）
+       ├─ 2) 等联网（ping 223.5.5.5 / 114.114.114.114，上限 30 分钟）
+       ├─ 3) MAS：联网才跑 /HWID（Windows），/Ohook 常跑（Office）
+       ├─ 4) 调 SoftwareLicensingProduct 拿真实 WIN_LICENSE（0/1）
+       ├─ 5) Office 装成了才 rmdir /s /q C:\OfficeInstall（约 3.6 GB）
+       └─ 6) 写 ACTIVATION_RESULT.txt（NETWORK / OFFICE / HWID_EXIT / OHOOK_EXIT / WIN_LICENSE / DONE）
             + OFFICE_DONE → schtasks /Delete 自删任务
 
 FirstBoot.ps1（用户会话，RunOnce 触发）
@@ -819,7 +855,7 @@ Release 描述里会带：构建号、通道、镜像内版本列表、大小、
 | 官方安装程序报「Windows 安装遇到错误。错误代码: `0x80070002 - 0x40030`」 | `windowsPE` 阶段某条 `RunSynchronous` 失败（`0x80070002` = 找不到文件，`0x40030` = 应答文件 `RunSynchronous` 应用失败）。历史根因是 `sc config wuauserv`（WinPE 里没有 `sc.exe`），已修：删掉该命令 + 每条命令都套 `cmd /c "… & exit 0"`。若仍复现，关掉 `hw_bypass` 只留基础应答文件重跑 |
 | 开机进桌面弹出进度窗口后**卡死**，只能重启 | 上一版 `FirstBoot.ps1` 在 UI 线程上 `Start-Sleep` 阻塞了 WPF 消息泵，已改成「后台 runspace + `ShowDialog` + `DispatcherTimer`」。装新 ISO 即可；旧镜像上可以任务管理器结束 `powershell` 进程，不影响激活 |
 | 装完系统 **Win 和 Office 都没激活** | 激活器原来是 `SetupComplete` 的子进程，重启一次就被杀。现在改用计划任务 `SYSTEM_Intel_MIC_Activate`（`ONSTART` / SYSTEM，跑完自删）。装新 ISO；旧镜像可手动以管理员运行 `C:\FirstBoot\Activate.cmd`，或双击 `C:\MAS\MAS_AIO.cmd` |
-| 「入门」「Windows 备份」「OneDrive」「Windows 安全中心」还在 | 离线镜像里这几个根本没注册成预置包，必须在线删。看 `C:\FirstBoot\cleanup.log`；若 `CLEANUP_DONE` 标记已存在但没删干净，删掉 `C:\FirstBoot\CLEANUP_DONE` 后重启，计划任务会重跑一遍 |
+| 「入门」「Windows 备份」「OneDrive」「Windows 安全中心」还在 | 离线镜像里这几个根本没注册成预置包（是**随首登才注册的 staged 包**），必须登录之后才删得掉。先看 `C:\FirstBoot\cleanup.log`：带 `no logon seen` 就说明它还没等到登录 → 注销再登录一次会由 `ONLOGON` 触发器重跑。若任务已自删但没删干净，先删 `C:\FirstBoot\CLEANUP_DONE`，再用管理员 PowerShell 跑 `powershell -NoProfile -ExecutionPolicy Bypass -File C:\FirstBoot\Cleanup.ps1` |
 | 进度窗口显示 ⚠ 激活未完成 | 看 `C:\FirstBoot\activation.log`（`HWID_EXIT` / `OHOOK_EXIT` / `WIN_LICENSE`）。联网后重跑 `C:\FirstBoot\Activate.cmd`，或双击 `C:\MAS\MAS_AIO.cmd` 手动选方法 |
 | 首次开机后 Office 没装上 | Office 是**静默安装**（`Display Level="None"`，SYSTEM 后台跑，不会弹窗）。看 `C:\FirstBoot\activation.log` 里的 `starting Office setup` / `Office installed`，以及 `C:\FirstBoot\OFFICE_DONE`；装失败会保留 `C:\OfficeInstall`（唯一离线安装源），可手动 `setup.exe /configure configuration.xml` |
 | 想知道某个包/服务/功能为什么还在 | 日志里搜 `[keep]`（Appx 保留判定）、`[feature]`（可选功能全表）、`[size:清理前]`（体积分布） |
