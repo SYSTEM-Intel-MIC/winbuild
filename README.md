@@ -81,7 +81,7 @@ Actions → **Build Windows 11 ISO** → *Run workflow*：
 | `build` | 文本 | **`28020`** | **构建号，可手填**：`28020` = 该版本最新修订；精确版本填 `28020.3142`。查最新见下节 |
 | `channel` | 下拉 | **`insider`** | `insider` = Dev/Beta/Canary 预览版；`stable` = 正式版（title 含 `version 26H2` 之类） |
 | `edition` | 下拉 | **`enterprise`** | `enterprise` 仅企业版；`pro` 专业版；`enterprise_pro` 专业版+企业版；`multi` 家庭版+专业版 |
-| `updates` | 开关 | **true** | 集成最新累积更新（UUP dump 下载更新包） |
+| `updates` | 开关 | **false** | 集成最新累积更新（UUP dump 下载更新包）。**默认关**：LCU/Enablement/SSU/NetFx/SetupDU/SafeOSDU 会让镜像涨 1~2 GB |
 | `netfx3` | 开关 | **true** | 预装 .NET Framework 3.5 |
 | `esd` | 开关 | **true** | 重新封盘时把 `install.wim` 导出成 `install.esd`（solid 压缩），详见「体积优化」 |
 | `reset_base` | 开关 | **true** | UUP 转换阶段 `ResetBase=1`，镜像更小、更慢 |
@@ -93,14 +93,14 @@ Actions → **Build Windows 11 ISO** → *Run workflow*：
 | `hw_bypass` | 开关 | **true** | windowsPE 阶段写 `LabConfig`，绕过 **TPM / 安全启动 / 内存** 检查（依赖 `unattend`） |
 | `skip_oobe` | 开关 | **true** | 跳过 EULA / 微软账户 / 无线设置 / 隐私设置页，`ProtectYourPC=3`（依赖 `unattend`） |
 | `oem_org` | 文本 | **`SYSTEM-Intel-MIC`** | `RegisteredOrganization`：winver「组织」 |
-| `oem_provider` | 文本 | **`SYSTEM-Intel-MIC`** | `SupportProvider`：「获取帮助」里的支持提供方 |
+| `oem_provider` | 文本 | **`SYSTEM-Intel-MIC的B站个人主页`** | `SupportProvider`：「获取帮助」按钮上显示的支持提供方名称（Win11 用它覆盖 System Manufacturer） |
 | `oem_url` | 文本 | **`https://space.bilibili.com/1978487514`** | `SupportURL`：「获取帮助」跳转链接；缺协议头会自动补 `https://` |
 | `oem_manufacturer` | 文本 | **`SYSTEM-Intel-MIC`** | `Manufacturer`（已弃用，只写注册表，Win11「设置→关于」不再显示） |
 | `oem_logo` | 文本 | *（空）* | `Logo` 路径；留空且仓库有 `OEM/logo.bmp` 时自动用 `C:\Windows\System32\oemlogo.bmp` 并把文件塞进 `install.wim` |
 | `oem_phone` | 文本 | *（空）* | `SupportPhone`（已弃用） |
-| `deep_debloat` | 开关 | **true** | 离线精简 `install.wim`：Appx + Capability + 可选功能移除 + 组件清理 + 注册表 + 服务 |
+| `deep_debloat` | 开关 | **true** | 离线精简 `install.wim`：Appx 白名单+强删名单 + Capability 模糊匹配 + 可选功能移除 + 组件清理 + 注册表 + 服务 + 删更新类计划任务 |
 | `office_offline` | 开关 | **true** | 离线集成 Office 365（Word/Excel/PowerPoint），ODT + 离线包在 Action 下载，首登录自动安装 |
-| `mas_activate` | 开关 | **true** | 首登录运行 MAS 永久激活 Windows + Office |
+| `mas_activate` | 开关 | **true** | SYSTEM 后台等 Office 装完 + 等联网后，无人值守跑 MAS `/HWID` + `/Ohook` |
 | `perf_tweaks` | 开关 | **true** | 见下方「四个精简开关的门控关系」 |
 
 共 **24 个输入**，全部默认值就是当前线上跑通的组合。
@@ -112,15 +112,16 @@ Actions → **Build Windows 11 ISO** → *Run workflow*：
 
 ```
 任一开关为真 ──┐
-  deep_debloat ─┼──> 进入 Invoke-OfflineCustomization（挂载 install.wim 做下面 ①~⑦ 全部动作）
+  deep_debloat ─┼──> 进入 Invoke-OfflineCustomization（挂载 install.wim 做下面 ①~⑧b 全部动作）
   office_offline ┘
   mas_activate
   perf_tweaks
 ```
 
 - **`deep_debloat` 单独关掉是不够的**：只要 `office_offline` / `mas_activate` / `perf_tweaks`
-  还开着，脚本照样会进离线定制，①~④ 的精简动作（Appx / Capability / 可选功能 / 组件清理 /
-  服务 / 注册表）**也会一并执行**——这几步在函数内部没有再按 `deep_debloat` 二次判断。
+  还开着，脚本照样会进离线定制，①~⑧b 的精简动作（Appx / Capability / 可选功能 / 组件清理 /
+  服务 / 注册表 / DEFAULT hive / 计划任务）**也会一并执行**——这几步在函数内部没有再按
+  `deep_debloat` 二次判断。
 - 想要「只要 Office，不要任何精简」：把 `deep_debloat` 和 `perf_tweaks` 都关掉，只留 `office_offline`。
   （当前实现做不到，需要改代码；见 `Get-UupIso.ps1` 的 `Invoke-OfflineCustomization`。）
 - `perf_tweaks` 目前**没有独立的额外动作**，它只是四个门控开关之一（`$regPaths`、服务清单
@@ -150,6 +151,7 @@ Actions → **Build Windows 11 ISO** → *Run workflow*：
 | pass | 内容 | 开关 |
 | --- | --- | --- |
 | `windowsPE` | `Microsoft-Windows-Setup\RunSynchronous` 往 `HKLM\SYSTEM\Setup\LabConfig` 写 `BypassTPMCheck` / `BypassSecureBootCheck` / `BypassRAMCheck`；外加 `International-Core-WinPE` 固定 zh-CN 输入法 | `hw_bypass` |
+| `windowsPE` | **无条件**执行 4 条 `RunSynchronous`：`sc config wuauserv start= disabled`（关掉 WinPE 的更新服务 → 安装程序不会去 WU 拉「安装动态更新」Setup DU）+ 往 PE 注册表写 `AU\NoAutoUpdate=1` / `AUOptions=2` / `AutoInstallMinorUpdates=0`（拦住 OOBE 期的检查更新） | 无开关（恒定执行） |
 | `oobeSystem` | `OOBE`：`HideEULAPage` / `HideOEMRegistrationScreen` / `HideOnlineAccountScreens` / `HideWirelessSetupInOOBE` / `ProtectYourPC=3`；`OEMInformation`、`RegisteredOrganization`、`TimeZone=China Standard Time` | `skip_oobe` / `oem_*` |
 
 `LabConfig` 三个键的写法（`reg add HKLM\SYSTEM\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f`）：
@@ -181,15 +183,18 @@ Actions → **Build Windows 11 ISO** → *Run workflow*：
 **实现方式（先看懂这个，下面的名单才说得通）：**
 
 ```powershell
-foreach ($k in $keep) { if ($app -like "*$k*") { $shouldKeep = $true; break } }
-if ($shouldKeep) { Write-Host "[keep] $app"; continue }   # 命中白名单 → 保留
-dism /Remove-ProvisionedAppxPackage /PackageName:$app      # 没命中 → 移除
+foreach ($k in $keep)       { if ($app -like "*$k*") { $shouldKeep = $true;  break } }  # 白名单：命中就留
+foreach ($f in $forceRemove){ if ($app -like "*$f*") { $shouldKeep = $false; break } }  # 强删名单：命中就删（优先级更高）
+if ($shouldKeep) { Write-Host "[keep] $app"; continue }   # 保留
+dism /Remove-ProvisionedAppxPackage /PackageName:$app      # 其余全部移除
 ```
 
-- `$keep` 是**保留白名单**，匹配方式是**包含匹配**（`*关键词*`），不是精确匹配。
+- `$keep` 是**纯保留白名单**，匹配方式是**包含匹配**（`*关键词*`），不是精确匹配；
+  **没命中的一律删除**。
+- `$forceRemove` 是**强删名单，优先级高于 `$keep`**：哪怕包名恰好撞上保留关键词，
+  只要命中强删名单就一定删，用来堵死「该删没删」的漏洞。
 - 日志里每个包都会打印一行 `[keep]`（保留）或 `[fail]`（移除失败 + 退出码），
   **要看镜像里到底 provision 了哪些包，直接翻日志的 `[keep]` 列表**，不用猜。
-- **白名单同时是「需求清单」**：下面是按用途归类的实际内容（`Get-UupIso.ps1` 441–487 行）。
 
 | 类别 | 关键词（节选） | 为什么留 |
 | --- | --- | --- |
@@ -201,27 +206,55 @@ dism /Remove-ProvisionedAppxPackage /PackageName:$app      # 没命中 → 移�
 | **编解码器** | `Codec` `WebMediaExtensions` `VP9VideoExtensions` `HEIFImageExtension` `AV1VideoExtensions` `MPEG2VideoExtensions` `HEVCVideoExtensions` `AVCEncoderVideoExtension` `RawImageExtension` `WebpImageExtension` | 用户点名保留；缺了 WebP/HEIF/AV1/HEVC 视频和图片打不开 |
 | **运行库** | `WindowsAppRuntime` `WindowsAppSDK` `VCLibs` `VCLibs.140.00` `NET.Native` `UI.Xaml` `WebView` | WindowsAppRuntime 是大量应用的依赖，**删了会连带废掉一批 App** |
 | 桌面应用桥 | `Widgets` `PowerAutomateDesktop` `StartExperiencesApp` `ApplicationCompatibilityEnhancements` | 组件运行时 / 开始菜单体验 |
-| 通讯 | `MSTeams` `Teams` `Outlook` `OneDrive` `Skype` `YourPhone` | 保留以免用户装完发现聊天/邮件/网盘没了 |
+**`$forceRemove` 强删名单（命中必删，优先级高于 `$keep`）：**
 
-> **已知问题（保守导致的「不够干净」）：** 白名单里还混着一批看起来像垃圾的关键词——
-> `Xbox` `Gaming` `BingNews` `BingWeather` `BingTravel` `BingSports` `BingFinance` `FeedbackHub`
-> `GetHelp` `Getstarted` `OfficeHub` `GetOffice` `People` `Maps` `Solitaire` `Wallet` `Translator`
-> `VoiceRecorder` `OneNote` `Todos` `Tips` `Cortana` `Print3D` `3DViewer` `MixedReality` …
-> 在**包含匹配**下，这些关键词会把同名包**保住**，等于「该删的没删」。
-> 实测在 build 28020 上这些包大多**根本没被 provision**，把白名单瘦身后只省 **28 MB**，
-> 所以现在**优先保证不误删**。要更激进：把对应关键词从 `$keep` 里删掉即可，
-> 下次构建日志的 `[keep]` 列表会立刻告诉你删对了没。
+| 分组 | 关键词 | 你为什么点名要删 |
+| --- | --- | --- |
+| 装机实测还留着的 | `Xbox` `GamingApp` `MicrosoftSolitaireCollection` `BingNews` `YourPhone` `GetHelp` | Xbox 全家 / 纸牌 / 微软资讯 / 手机连接 / 获取帮助 |
+| 通讯 / 网盘 | `MSTeams` `Teams` `OutlookForWindows` `Outlook` `OneDrive` | Teams、新版 Outlook、OneDrive |
+| 反馈 / 推广 | `WindowsFeedbackHub` `MicrosoftOfficeHub` `Getstarted` `BingWeather` `CrossDevice` | 反馈中心、Office 推广、入门、天气、跨设备协同 |
+| 预装垃圾 | `StickyNotes` `Todos` `Clipchamp` `SoundRecorder` `MicrosoftFamily` `QuickAssist` `WebExperience` `People` `Print3D` `3DViewer` `MixedReality` `Cortana` `WindowsMaps` `Maps` `WindowsWallet` `Wallet` `WindowsCommunicationsApps` | 便笺 / 待办 / AI 剪辑 / 录音机 / 家庭 / 快速助手 / 小组件前端 / 人脉 / 3D / 混合现实 / 小娜 / 地图 / 钱包 / 旧版邮件日历 |
+
+**①b OneDrive 是系统级的，不走 Appx（单独一步）：**
+
+| 动作 | 路径 | 为什么 |
+| --- | --- | --- |
+| 删安装器 | `Windows\System32\OneDriveSetup.exe`、`Windows\SysWOW64\OneDriveSetup.exe` | Win11 首次登录会自动跑它把 OneDrive 装回来 |
+| 删已解包目录 | `Program Files\Microsoft OneDrive`、`Program Files (x86)\Microsoft OneDrive` | 镜像里通常还没有，存在才删 |
+| 删 `Run` 启动项 | `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\OneDriveSetup` 与 `Wow6432Node` 下同名值 | 注册表里 `Type = 'Delete'` 走 `reg delete` |
+
+> **修复记录（装机实测）：** 上一版把 `Xbox` `Solitaire` `BingNews` `YourPhone` `GetHelp`
+> `FeedbackHub` `OfficeHub` `StickyNotes` `Todos` `Clipchamp` `MSTeams` `Outlook` 等**垃圾关键词
+> 写进了 `$keep`**，包含匹配把它们全保住了 —— 装机后 Xbox/纸牌/资讯/手机连接/获取帮助全都还在，
+> 日志 116 行 `[keep]` 却只删掉 6 个包。现在 `$keep` 只留必要项，并用 `$forceRemove` 兜底。
+> 删掉的都能从应用商店装回来，不影响系统功能。
 
 ### ② 移除 AI / Copilot / Recall（Capability）
 
-| Capability | 作用 |
+**实现方式：先 `/Get-Capabilities` 打出镜像内**全部** capability（日志逐条 `[cap] xxx`），
+再按关键词**模糊匹配**移除。**
+
+> **为什么从「写死名字」改成「模糊匹配」**：上一版是精确写死 6 个名字，结果 build 28020 上
+> `Recall` **根本没被删掉**（名字对得上但列表里漏了），AI 平台的其它子项也全留着。
+> 模糊匹配 + 打印全表，日志里能直接核对删了什么、还剩什么。
+
+| 匹配关键词 | 删掉的东西 |
 | --- | --- |
-| `Recall` | 屏幕记录 + AI 回溯，隐私争议最大，删 |
-| `Microsoft.Windows.AI.Copilot.Provider` | Copilot 核心提供程序，删 |
-| `Microsoft.Copilot` | 旧版 Copilot，删 |
-| `Microsoft.Windows.Clipchamp` | AI 视频剪辑，删 |
-| `Microsoft.Windows.Photos.AI` | 照片 AI 抠图/修饰，删 |
-| `Microsoft.Windows.AppRuntime.AI` | AI 运行时，删 |
+| `Recall` | 屏幕记录 + AI 回溯（隐私争议最大） |
+| `Copilot` | Copilot 全部能力（`Microsoft.Copilot`、`Microsoft.Windows.AI.Copilot.Provider` 一并覆盖） |
+| `Clipchamp` | AI 视频剪辑 |
+| `Photos.AI` | 照片 AI 抠图/修饰 |
+| `AppRuntime.AI` | AI 运行时分发 |
+| `Microsoft.Windows.AI` / `Microsoft.Windows.Ai` | Windows AI 平台全家（`Ai.Clients` / `Ai.Foundation` / `Ai.Actions` …） |
+| `SemanticIndex` | 语义索引（Recall / AI 搜索的后端） |
+| `MathRecognizer` | 手写公式 AI 识别 |
+| `AIFoundry` `AiFoundry` `WindowsAI` | Windows AI Foundry |
+| `DevHome` | 开发者主页（预装无效应用） |
+
+> 匹配不到**不会报错**；解析不出 capability 列表时会 `Write-Warning` 提示「AI 组件可能没删干净」。
+> 解析用的是宽松的 `Identity : (.+)`，防 DISM 字段名随版本变动导致一条都匹配不上。
+> **不在清单里**：`Language.OCR` / `Language.Handwriting` / TTS 这类**输入法与辅助功能**能力，
+> 删了会废掉截图工具的「文本提取」、语音输入和讲述人，所以保留。
 
 ### ③ 体积诊断（清理前）
 
@@ -251,10 +284,31 @@ dism /Remove-ProvisionedAppxPackage /PackageName:$app      # 没命中 → 移�
 | `SNMP` | SNMP 客户端 | 网络管理场景，家用用不到 |
 | `PowerShellV2` | PowerShell **v2** 旧引擎 | 5.1 和 7 完全不受影响（v2 是 2009 年的引擎） |
 | `Rsat` `DirectoryServices` `IPAM` `DataCenterBridging` | 服务器管理工具 | 客户端系统用不到 |
+| `ServicesForNFS` `NFS-Administration` | NFS 客户端/管理 | NFS 是局域网 Unix 共享，家用基本不用 |
+| **`IIS-`** | **IIS Web 服务器全套（28020 上有 51 个 `IIS-*`）** | 桌面机不会架站；体积大头之一 |
+| **`WAS-`** | IIS 进程激活服务（`WAS-ConfigurationAPI` `WAS-ProcessModel` `WAS-WindowsActivationService`） | 随 IIS 走 |
+| **`MSMQ-`** | 消息队列 7 项 | 企业中间件，桌面用不到 |
+| **`WCF-`** | WCF 服务/激活 6 项 | 同上，WCF 自承载场景 |
+| **`Client-`** | 嵌入式锁定设备 7 项（Kiosk / 键盘过滤 / UWF / Embedded 登录…） | 只有售货机、展台设备用 |
+| **`MultiPoint`** | MultiPoint 多点服务 3 项 | 教室一拖多场景 |
+| **`Sysmon`** `Sysmon-Service` | 系统监视器 | 需要时可单独装回 |
+| `HostGuardian` | 主机守护服务（HGS） | 虚拟化安全隔离，家用用不到 |
+| `AppServerClient` | 远程应用（RemoteApp）客户端 | 很少用；`MSRDC` 远程桌面客户端**保留** |
+| `NetFx4-AdvSrvs` `NetFx4Extended-ASPNET45` | .NET 高级服务 / ASP.NET 4.5 扩展 | 服务端扩展，桌面用不到 |
+| `SmbDirect` | RDMA 网卡直连 | 需要万兆 RDMA 网卡才用得上 |
+| `InternetPrinting` | 互联网打印（IPP 服务器） | **本地打印与「另存为 PDF」是另外两个 feature，不受影响** |
+| `Recall` | AI 回溯功能位 | AI 组件，必须删 |
 
-**铁律：下面这些绝不出现在清单里** —— 媒体播放器 / `MediaFoundation` / 编解码器 /
-`.NET 3.5` / IE 模式（Edge 依赖）/ 搜索 / 远程桌面 / `OpenSSH.Client` / 打印与 PDF。
-清单里的关键词**匹配不到就跳过**，不会报错。
+**反向白名单 `$featuresKeep`（即使命中上面的关键词也绝不删）：**
+
+`DirectPlay` `LegacyComponents`（老游戏）· `MediaPlayback` `WindowsMediaPlayer`（**用户点名**）·
+`SearchEngine`（开始菜单搜索）· `Windows-Defender` · `Printing-Foundation-Features` `PrintToPDF` ·
+`MSRDC`（远程桌面客户端）· `TIFFIFilter`（TIFF 预览）· `Containers` `Hyper-V` `HypervisorPlatform`
+`VirtualMachinePlatform` `Subsystem-Linux`（Docker / WSL / 虚拟机）· `Camera`
+
+**铁律：下面这些绝不出现在删除清单里** —— 媒体播放器 / `MediaFoundation` / 编解码器 /
+`.NET 3.5` / IE 模式（Edge 依赖）/ 搜索 / 远程桌面 / `OpenSSH.Client` / 打印与 PDF /
+Hyper-V 与 WSL。清单里的关键词**匹配不到就跳过**，不会报错。
 
 ### ⑤ 离线组件清理（`/Cleanup-Image /StartComponentCleanup /ResetBase`）
 
@@ -292,6 +346,7 @@ dism /Remove-ProvisionedAppxPackage /PackageName:$app      # 没命中 → 移�
 | Xbox / Game Bar 社交后台 | `XblAuthManager` `XblGameSave` `XboxNetApiSvc` `XboxGipSvc` `XboxAccessoryManagementService` `GameBarFTServer` `GameDVR_Svc` | Xbox 账号联机与录制后台 |
 | 设备元数据 / 推送安装 / 远程注册表 / 嵌入式 | `DevicesAnalytics` `PushToInstall` `RemoteRegistry` `EmbeddedMode` | 远程注册表是安全隐患，推送安装是商店静默装 |
 | 远程桌面 USB 重定向 | `UmRdpService` | 只禁 USB 重定向，**`TermService` 保留，远程桌面照样能用** |
+| Windows Insider / 扫描仪 | `wisvc` `stisvc` | Insider 注册服务（已经是预览版，不必再上报通道）；WIA 扫描仪服务（没有扫描仪）。**`Spooler` 保留，打印不受影响** |
 
 **刻意保留（改了会把系统搞坏或砍掉基础功能）：**
 
@@ -396,14 +451,37 @@ dism /Remove-ProvisionedAppxPackage /PackageName:$app      # 没命中 → 移�
 | `Policies\Microsoft\Windows\DNSClient` | `DisableMulticast=1` | 关 DNS 多播（SSDP/网络发现噪音） |
 | `Policies\Microsoft\Windows\DeliveryOptimization` | `DownloadMode=0` | 更新下载**只走 HTTP**，不做 P2P 上传 |
 
-#### Windows 更新
+#### Windows 更新（**硬需求：不允许自动更新，OOBE 也不更新；手动检查更新保留**）
 
 | 键 | 值 | 原因 |
 |---|---|---|
-| `Policies\Microsoft\Windows\WindowsUpdate\AU` | `NoAutoUpdate=0` | **保持自动更新开**（0 = 不禁止） |
-| `Policies\Microsoft\Windows\WindowsUpdate\AU` | `AUOptions=4` | 自动下载并自动安装 |
-| `Policies\Microsoft\Windows\WindowsUpdate` | `DeferFeatureUpdatesPeriodInDays=0` | 不推迟功能更新 |
-| `Policies\Microsoft\Windows\WindowsUpdate` | `DeferQualityUpdatesPeriodInDays=0` | 不推迟质量更新 |
+| `Policies\Microsoft\Windows\WindowsUpdate\AU` | `NoAutoUpdate=1` | **关掉自动检查/下载/安装**；设置里手动「检查更新」仍然可用 |
+| `Policies\Microsoft\Windows\WindowsUpdate\AU` | `AUOptions=2` | 兜底：就算策略被绕过，也只「通知下载并通知安装」 |
+| `Policies\Microsoft\Windows\WindowsUpdate\AU` | `AutoInstallMinorUpdates=0` | 连小更新都不许悄悄装 |
+| `Policies\Microsoft\Windows\WindowsUpdate` | `DeferFeatureUpdatesPeriodInDays=400` | 功能更新推迟 400 天（约等于永不来） |
+| `Policies\Microsoft\Windows\WindowsUpdate` | `DeferQualityUpdatesPeriodInDays=400` | 质量更新同上 |
+| `Policies\Microsoft\Windows\WindowsUpdate` | `NoAutoRebootWithLoggedOnUsers=1` | 就算有更新也不许自动重启 |
+| `Policies\Microsoft\Windows\WindowsUpdate` | `ExcludeWUDriversInQualityUpdate=1` | Windows Update 不自动装驱动（要驱动用 `drivers` 开关离线注入） |
+| `Policies\Microsoft\WindowsStore` | `DisableAutoUpdate=1` | **商店也不许自己更新**，否则被删的预装 Appx 可能被推回来 |
+
+> 三条防线合起来：**① 离线注册表（上表）**、**② 应答文件 `windowsPE` 关掉 PE 的 `wuauserv`
+> + 写 AU 策略**（拦安装期的 Setup DU 和 OOBE 检查）、**③ 删掉会自己跑更新的计划任务**（见 ⑧b）。
+> `wuauserv` 与 `WaaSMedicSvc` **刻意不禁用** —— 禁了手动更新就废了，你要的是「不自动」不是「不能」。
+
+#### 广告 / 推广 / 预留空间 / 活动历史
+
+| 键 | 值 | 原因 |
+|---|---|---|
+| `Policies\Microsoft\Windows\CloudContent` | `DisableWindowsSpotlightFeatures=1` | 关锁屏「Windows 聚焦」壁纸轮播（省网络与后台） |
+| `Policies\Microsoft\Windows\CloudContent` | `DisableWindowsSpotlightOnSettings=1` / `DisableWindowsSpotlightOnActionCenter=1` | 设置页与操作中心不再推聚焦图 |
+| `Policies\Microsoft\Windows\CloudContent` | `DisableSoftLanding=1` | 开始菜单不再推「提示和建议」 |
+| `Policies\Microsoft\Windows\CloudContent` | `DisableThirdPartySuggestions=1` | 不推第三方应用建议 |
+| `Policies\Microsoft\Windows\CloudContent` | `DisableTailoredExperiencesWithDiagnosticData=1` | 不用诊断数据做个性化推荐 |
+| `Policies\Microsoft\Windows\AdvertisingInfo` | `DisabledByGroupPolicy=1` | 关广告 ID（个性化广告） |
+| `Policies\Microsoft\Windows\System` | `EnableActivityFeed=0` `PublishUserActivities=0` `UploadUserActivities=0` | 关活动历史记录（时间线 + 云端同步用户操作） |
+| `Microsoft\Windows\CurrentVersion\ReserveManager` | `ShippedWithReserves=0` | 关掉 C 盘**约 7 GB 的「更新预留空间」** |
+| `Microsoft\Windows\CurrentVersion\ContentDeliveryManager` | `SilentInstalledAppsEnabled=0` `PreInstalledAppsEnabled=0` `OemPreInstalledAppsEnabled=0` | HKLM 版静默装应用开关（与 ⑧a 的 HKCU 版双保险） |
+| `Microsoft\Windows\CurrentVersion\Run` | `OneDriveSetup` **删值**（`Type='Delete'`，`Wow6432Node` 下同样删） | 阻止首次登录自动装 OneDrive |
 
 #### 仅 Server SKU 会读的键（客户端上无效果，留着无害）
 
@@ -421,6 +499,50 @@ dism /Remove-ProvisionedAppxPackage /PackageName:$app      # 没命中 → 移�
 
 > 代码里有几对键被**写了两遍**（值相同，例如 `CacheMemorySizeInBytes`、`EnableSmartScreen`、
 > `AllowCortana`）。`reg add /f` 是幂等的，重复写无副作用，只是日志里会出现两行。
+
+#### ⑧a DEFAULT 用户 hive（**新用户首次登录的 `HKCU` 默认值**）
+
+Windows 新建账户时会拷贝 `C:\Users\Default\NTUSER.DAT` 当模板，所以写进这里的值
+**对之后创建的每个账户都生效**。上面那张 HKLM 表里有一半优化（任务栏、资源管理器、
+静默装应用、广告 ID）其实落在 `HKCU`，只写 HKLM 是**白写**的，这一节补上。
+
+**写法**：`reg load HKLM\WWINBLDG_DEFAULT <镜像>\Users\Default\NTUSER.DAT`
+→ 写 `HKLM\WWINBLDG_DEFAULT\Software\...`（**落盘就是 `HKCU\Software\...`**）→ `reg unload`。
+load 失败只 `Write-Warning` 跳过，不影响构建。
+
+| 键（`HKCU\Software\` 下） | 值 | 原因 |
+|---|---|---|
+| `Microsoft\Windows\CurrentVersion\ContentDeliveryManager` | `SilentInstalledAppsEnabled=0` `PreInstalledAppsEnabled=0` `OemPreInstalledAppsEnabled=0` | **不静默给新账户塞应用**（「装完自己又冒出一堆 Appx」的元凶） |
+| 同上 | `SystemPaneSuggestionsEnabled=0` `SubscribedContent-338388Enabled=0` `SubscribedContent-338389Enabled=0` `SubscribedContent-338393Enabled=0` | 开始菜单「推荐的项目」与应用推广 |
+| 同上 | `RotatingLockScreenOverlayEnabled=0` | 锁屏不叠加聚焦内容 |
+| `Microsoft\Windows\CurrentVersion\AdvertisingInfo` | `Enabled=0` | 关广告 ID |
+| `Microsoft\Windows\CurrentVersion\Privacy` | `TailoredExperiencesWithDiagnosticDataEnabled=0` | 关诊断数据个性化 |
+| `Microsoft\Windows\CurrentVersion\Explorer\Advanced` | `TaskbarDa=0` | 隐藏任务栏**小组件按钮**（`WebExperience` 已移除，留着是死按钮） |
+| 同上 | `ShowTaskViewButton=0` | 隐藏任务视图（与 HKLM 那条一致） |
+| 同上 | `HideFileExt=0` | **显示文件扩展名**（防 `.jpg.exe` 钓鱼） |
+| 同上 | `LaunchTo=1` | 资源管理器打开时直接进「此电脑」而不是「快速访问」 |
+| `Microsoft\Windows\CurrentVersion\Search` | `SearchboxTaskbarMode=2` | 搜索框只留图标，省一段常驻 UI |
+| `Microsoft\Windows\CurrentVersion\Themes\Personalize` | `EnableTransparency=0` | **关透明特效**，少一层合成（性能） |
+| `Microsoft\Windows\CurrentVersion\Explorer\Serialize` | `StartupDelayInMSec=0` | 启动项不强制延迟 1 秒，开机后图标更快就位 |
+| `Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location` | `Value=Deny` | 关位置服务（设置 → 隐私里可再开） |
+
+#### ⑧b 删掉会自己跑更新/遥测的计划任务
+
+策略只管 Windows Update 主程序，**计划任务是另一条触发路径**。直接删
+`Windows\System32\Tasks\Microsoft\Windows\` 下的任务文件即可（离线状态最省事），
+只删更新与遥测类，**不碰**磁盘整理、系统诊断、Defender 扫描这些正经任务：
+
+| 任务文件 | 作用 |
+|---|---|
+| `WindowsUpdate\Scheduled Start` | ⭐ **例行 Windows 更新**，会自动下载安装 |
+| `WindowsUpdate\Orchestrator\USO_UxBroker` `WindowsUpdate\Orchestrator\UpdateOrchestrator` | 更新编排器 |
+| `Automatic App Update` | 商店应用自动更新 |
+| `Maps\MapsToastTask` `Maps\MapsUpdateTask` | 离线地图更新 |
+| `Customer Experience Improvement Program\Consolidator` `Customer Experience Improvement Program\UsbCeip` | 客户体验改进（采样） |
+| `Application Experience\Microsoft Compatibility Appraiser` `Application Experience\ProgramDataUpdater` | 兼容性评估 |
+| `DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector` | 磁盘诊断数据收集 |
+
+文件不存在就跳过；删除失败只 `Write-Warning`。
 
 ## Office 365 离线集成（`office_offline`）
 
@@ -454,33 +576,60 @@ dism /Remove-ProvisionedAppxPackage /PackageName:$app      # 没命中 → 移�
 - **下载**：构建时从官方仓库原始文件下载
   `https://raw.githubusercontent.com/massgravel/Microsoft-Activation-Scripts/master/MAS/All-In-One-Version-KL/MAS_AIO.cmd`
 - **放置**：镜像根的 `\MAS\MAS_AIO.cmd` → 装完就是 `C:\MAS\MAS_AIO.cmd`
-- **触发**：`FirstBoot.ps1` 在**等 Office 装完 + 清理安装包之后**运行
-  （`cmd /c C:\MAS\MAS_AIO.cmd`，`-Wait` 阻塞到脚本结束）
-- **激活方式**：Windows 走 HWID 永久激活，Office 走 KMS（由 MAS 自己选参数）
-- **风险提示**：`MAS_AIO.cmd` 是第三方脚本，Defender 可能报「hacktool」，
-  这是误报性质的提示，介意就关掉 `mas_activate` 开关
+
+**跑在哪：`C:\FirstBoot\Activate.cmd`（SetupComplete 用 SYSTEM 后台拉起），不是 `FirstBoot.ps1`。**
+
+> **为什么改**：上一版是 `FirstBoot.ps1` 里 `cmd /c MAS_AIO.cmd`，三个坑全踩了 ——
+> ① 没带参数 → MAS 弹**交互菜单**，没人按键就一直卡住；
+> ② 跑在**普通用户会话** → 没权限、可能弹 UAC；
+> ③ 没等联网 → 26100+ 的 HWID/TSforge **必须联网**才成功。
+> 现在交给 SYSTEM 后台进程，前台 `FirstBoot.ps1` 只负责**显示结果**。
+
+**执行顺序（`Activate.cmd`）：**
+
+1. **等 `C:\FirstBoot\OFFICE_DONE`**（由 `FirstBoot.ps1` 在 Office 装完后写），上限 90 分钟
+   —— 用标记而不是盲扫 `setup.exe` 进程，避免误等一个根本没起来的进程
+2. **等联网**（`ping 223.5.5.5` / `114.114.114.114`），上限 30 分钟
+3. 分两次调用 MAS（**分开跑，免得只有一个方法被执行**）：
+   - 联网时：`call MAS_AIO.cmd /HWID /S` → Windows 数字许可证永久激活
+   - 始终执行：`call MAS_AIO.cmd /Ohook /S` → Office 永久激活（离线也能成）
+   - **任意 switch 就进 unattended 模式**，不出菜单、不等按键（来源 massgrave.dev 官方开关文档）；
+     必须用 `call` 才能跑完返回继续写结果
+4. 用 WMI 复核**真实授权状态**：`Get-CimInstance SoftwareLicensingProduct -Filter
+   'PartialProductKey IS NOT NULL AND LicenseStatus = 1'`（不出任何弹窗）
+5. 结果写 `C:\FirstBoot\ACTIVATION_RESULT.txt`（`NETWORK=` `HWID_EXIT=` `OHOOK_EXIT=`
+   `WIN_LICENSE=` `DONE`），完整输出留在 `C:\FirstBoot\activation.log`
+
+**前台显示**：`FirstBoot.ps1` 轮询结果文件（上限 60 分钟），然后按「真实授权状态优先、
+退出码兜底」给出 ✅/⚠，并附日志尾部；失败时提示手动双击 `C:\MAS\MAS_AIO.cmd` 重试。
+
+- **风险提示**：`MAS_AIO.cmd` 是第三方脚本，Defender 可能报「hacktool」，属于误报性质，
+  介意就关掉 `mas_activate` 开关（关掉后 `FirstBoot.ps1` 只会显示未等到结果的提示）
 
 ## 首登录编排器（`SetupComplete.cmd` + `FirstBoot.ps1`）
 
-**触发链：**
+**触发链（三条线并行）：**
 
-1. OOBE 完成 → `C:\Windows\Setup\Scripts\SetupComplete.cmd` 被系统以 **SYSTEM** 权限执行
-2. `SetupComplete.cmd`：`start "" /MIN C:\OfficeInstall\setup.exe /configure ...`（Office **后台最小化**静默安装）
-3. `SetupComplete.cmd`：写 `HKLM\...\RunOnce\SYSTEM_Intel_MIC_FirstBoot` →
-   `powershell -NoProfile -ExecutionPolicy Bypass -File C:\FirstBoot\FirstBoot.ps1`
-4. 用户首次登录 → `RunOnce` 触发 `FirstBoot.ps1`（用户桌面会话）
-5. `FirstBoot.ps1` 先**自删** `RunOnce`（只跑一次），弹出**置顶、不可关闭**的窗口：
-   标题 `SYSTEM-Intel-MIC 优化版 Windows 11`，正文显示构建信息与 B 站主页
-   `https://space.bilibili.com/1978487514`
-6. 轮询 `setup.exe`（按 `ExecutablePath -like 'C:\OfficeInstall\*'` 判断，15 秒一次，上限 60 分钟），
-   状态栏持续显示 **「正在安装 Office 365 (Word/Excel/PowerPoint)，请勿关机或断电...」**
-   —— 如果 `SetupComplete` 那边没起来，这里会**补启动一次**
-7. 安装结束 → 校验三件套 → **清理 `C:\OfficeInstall`（释放约 3.6 GB）** → 状态栏显示「已清理安装包」
-8. 运行 `MAS_AIO.cmd` 激活 Windows + Office
-9. 状态栏显示「✅ 全部完成！Windows + Office 已激活，Office 已安装」→ 3 秒后自动关窗
+```
+SetupComplete.cmd（SYSTEM，OOBE 结束后）
+  ├─ start /MIN  C:\OfficeInstall\setup.exe /configure ...   → Office 后台静默安装
+  ├─ start /B    C:\FirstBoot\Activate.cmd                    → 后台激活器（等 Office → 等联网 → MAS）
+  └─ reg add HKLM\...\RunOnce\SYSTEM_Intel_MIC_FirstBoot      → 首次登录拉起 FirstBoot.ps1
 
-> 为什么弹窗放在 `FirstBoot.ps1` 而不是 `SetupComplete.cmd`：后者跑在 SYSTEM 会话里，
-> **桌面用户看不见它的 GUI**；`FirstBoot.ps1` 跑在用户会话里，弹窗才有效。
+FirstBoot.ps1（用户会话，首次登录）
+  ├─ 自删 RunOnce（只跑一次）
+  ├─ 置顶窗口显示进度
+  ├─ 轮询 Office 安装（15 秒一次，上限 60 分钟；没起来会补启动一次）
+  ├─ 校验三件套 → 清理 C:\OfficeInstall（约 3.6 GB）
+  ├─ 写 C:\FirstBoot\OFFICE_DONE  ──→  通知 Activate.cmd「Office 这步结束了」
+  ├─ 轮询 C:\FirstBoot\ACTIVATION_RESULT.txt（上限 60 分钟）
+  └─ 显示 ✅/⚠ 激活结果（附 activation.log 尾部）→ 20 秒后关窗
+```
+
+> **为什么激活不在 `FirstBoot.ps1` 里跑**：它是普通用户会话，没权限、不保证已联网、
+> Office 也未必装完。SYSTEM 后台进程一次解决三个问题，前台只负责「把结果显示给人看」。
+> 反过来，弹窗必须放 `FirstBoot.ps1`：`SetupComplete.cmd` 跑在 SYSTEM 会话里，
+> **桌面用户看不见它的 GUI**。
 
 ## 体积优化（实测数据）
 
@@ -488,13 +637,18 @@ dism /Remove-ProvisionedAppxPackage /PackageName:$app      # 没命中 → 移�
 
 | 手段 | 节省 | 状态 |
 |---|---|---|
-| ESD 重打包（`wimlib-imagex export` → solid LZMS） | **−1717 MB**（10445 → 8728 MB，耗时 4413 秒） | ✅ 实测 |
-| 剔除 arm64 交叉部件（Office 包内） | **−451 MB** | ✅ 实测 |
+| ESD 重打包（`wimlib-imagex export` → solid LZMS） | **−1732.5 MB**（10447.3 → 8714.8 MB，耗时 3762 秒） | ✅ 实测 |
+| 剔除 arm64 交叉部件（Office 包内） | **−451.4 MB** | ✅ 实测 |
 | `ResetBase`（UUP 转换阶段） | 基线的一部分 | ✅ 开着 |
-| Appx 白名单瘦身 | −28 MB（28020 上多数目标包本就没 provision） | ✅ 实测 |
-| 离线 `StartComponentCleanup /ResetBase` | 预期几百 MB | 🔄 待本轮实测 |
-| 可选功能移除（XPS/传真/SMB1/…） | 预期 200~500 MB | 🔄 待本轮实测 |
+| Appx 白名单瘦身 | −28 MB（28020 上多数目标包本就没 provision；改成强删名单后主要收益是**干净度**而非体积） | ✅ 实测 |
+| 离线 `StartComponentCleanup /ResetBase` | WinSxS 12823.1 → 12709.4 MB、servicing −1.5 MB，耗时 26 秒 | ✅ 实测 |
+| 14 个可选功能移除 | 0 失败；与上一步合并后**净收益仅 −13.4 MB** → **无损空间已经挖尽** | ✅ 实测 |
+| 可选功能移除**扩充**到 ~104 项（`IIS-` `MSMQ-` `WCF-` `Client-` `Sysmon` `Recall` …） | 待实测 | 🔄 本轮 |
+| **禁止集成累积更新（`updates=false`）** | **−1~2 GB**（LCU/Enablement/SSU/NetFx/SetupDU/SafeOSDU 全部不进镜像） | 🔄 本轮 |
 | **合计（前三项）** | 基线 11895 MB → **9755 MB**，省 **2140 MB（18%）** | ✅ |
+
+> 无损方向（`ResetBase` / 功能移除）上一轮实测**只净省 13.4 MB**，说明已经到顶；
+> 真正还能再砍的就是 `updates=false` 和这轮扩大的可选功能清单。
 
 **ESD 的实现位置与保护：**
 
