@@ -140,6 +140,14 @@ if ($oemUrlValue -and $oemUrlValue -notmatch '^[A-Za-z][A-Za-z0-9+.\-]*://') { $
 # ---------------------------------------------------------------------------
 function Write-Info([string] $Message) { Write-Host "==> $Message" }
 
+# 这个 .ps1 本身是 LF 换行存的（git 不做转换），PowerShell 的 here-string 会原样
+# 保留 LF。写出来的 .cmd / .ps1 用 LF 对 cmd.exe 来说属于「多数情况能跑但 goto 标签
+# 偶尔抽风」的灰色地带，所以统一在这里强制转成 CRLF，杜绝这类玄学问题。
+function Convert-ToCrlf([string] $Text) {
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    return ($Text -replace "`r`n", "`n" -replace "`n", "`r`n")
+}
+
 function Test-IniKey([string] $Text, [string] $Key) {
     return $Text -match "(?m)^[ \t]*$([regex]::Escape($Key))[ \t]*="
 }
@@ -361,10 +369,11 @@ function New-UnattendXml {
             }
             if ($blockUpdates) {
                 # 装机期拦更新：只用 reg add 写 AU 策略（WinPE 一定有 reg.exe，永远返回 0）。
-                # PE 注册表不进成品，这几条只作用于安装会话本身；
+                # PE 注册表不进成品，这几条只作用于安装会话本身（Setup 自己的 DU 检查）；
                 # 真正管用的 AU/商店策略在后面离线 SOFTWARE hive 段（4. 注册表优化）里。
+                # AUOptions=1 = 「从不检查更新」（2026-10-07 从 2 升级，配合「完全禁止更新组件」）
                 $syncCmds += @{ d = 'NoAutoUpdate'; p = (& $peWrap 'reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU /v NoAutoUpdate /t REG_DWORD /d 1 /f') }
-                $syncCmds += @{ d = 'AUOptions'; p = (& $peWrap 'reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU /v AUOptions /t REG_DWORD /d 2 /f') }
+                $syncCmds += @{ d = 'AUOptions'; p = (& $peWrap 'reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU /v AUOptions /t REG_DWORD /d 1 /f') }
                 $syncCmds += @{ d = 'AutoInstallMinorUpdates'; p = (& $peWrap 'reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU /v AutoInstallMinorUpdates /t REG_DWORD /d 0 /f') }
             }
             $x += '    <component name="Microsoft-Windows-Setup" ' + $cp + '>'
@@ -383,6 +392,31 @@ function New-UnattendXml {
         }
         $x += '  </settings>'
     }
+
+    # ---- specialize：装机中段（真实 Windows，不是 WinPE）以 SYSTEM 幂等注册 ----
+    # 为什么必须加这一段 —— 实测两次「Office 压根没装 + Win/Office 都没激活 + 四个点名
+    # Appx 也没删」的根因：
+    #   SetupComplete.cmd 只在「官方安装程序 + autounattend 生效」这条路径上才会执行。
+    #   一旦它没跑（用 DISM++/NTLite 部署、脚本被安全软件拦掉、装完后被清理……），
+    #   后面所有东西 —— 计划任务 SYSTEM_Intel_MIC_Activate / _Cleanup、RunOnce 进度窗 ——
+    #   一个都不会注册，表现就是「装完什么都没发生」。
+    # specialize 是 Windows Setup **自己必然执行**的一段，RunSynchronous 在这里跑在
+    # **完整 Windows**（有 schtasks.exe / reg.exe / cmd.exe，不是 WinPE）里，身份是 SYSTEM。
+    # 所以把「注册两个计划任务 + RunOnce」这一步搬进来，幂等地先做一遍；
+    # SetupComplete.cmd 之后再调同一个 C:\FirstBoot\Register.cmd 也无所谓（/F 覆盖）。
+    # 这里用 `& exit 0` 兜底：Register.cmd 万一不存在（关掉了精简/Office/MAS 开关），
+    # specialize 也绝不能返回非 0 去影响安装。
+    $x += '  <settings pass="specialize">'
+    $x += '    <component name="Microsoft-Windows-Deployment" ' + $cp + '>'
+    $x += '      <RunSynchronous>'
+    $x += '        <RunSynchronousCommand wcm:action="add">'
+    $x += '          <Order>1</Order>'
+    $x += '          <Path>' + (Escape-Xml 'cmd /c "C:\FirstBoot\Register.cmd & exit 0"') + '</Path>'
+    $x += '          <Description>SYSTEM-Intel-MIC register first-boot tasks</Description>'
+    $x += '        </RunSynchronousCommand>'
+    $x += '      </RunSynchronous>'
+    $x += '    </component>'
+    $x += '  </settings>'
 
     # ---- oobeSystem：OOBE / 账户 / OEM 信息 / 时区 ----
     if ($hasOobe -or $hasAcct -or $hasOem -or $loc) {
@@ -717,7 +751,7 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
         # ---- 3. 禁用服务 ----
         # 只禁用「纯后台/遥测/社交/没人用」的服务，且只在离线 hive 里真实存在时才改。
         # 刻意保留（改了会把系统搞坏或砍掉基础功能）：
-        #   Spooler(打印) / wuauserv(Windows 更新) / TrustedInstaller、AppXSvc、StateRepository、AppReadiness(装应用) /
+        #   Spooler(打印) / TrustedInstaller、AppXSvc、StateRepository、AppReadiness(装应用) /
         #   Themes(界面主题) / MpsSvc(防火墙) / LanmanServer、LanmanWorkstation(局域网共享) /
         #   TermService、UmRdpService(远程桌面) / Netlogon、KeyIso、EventSystem(账户/事件) /
         #   EFS / msiserver(MSI 安装) / RasMan、RasAuto(VPN) / WSearch、SearchIndexer(搜索) /
@@ -725,6 +759,8 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
         #   LSM、RpcSs、DcomLaunch(系统核心) / BrokerInfrastructure、SystemEventsBroker(后台任务)
         # 注意：WinDefend/WdNisSvc/SecurityHealthService/Sense（Windows 安全中心 + Defender）
         # **已经不再保留** —— 用户明确要求禁用并卸载安全中心，见下面「安全中心 / Defender」组。
+        # 2026-10-07 起 wuauserv(Windows 更新) **也不再保留** —— 用户明确要求
+        # 「删除并完全禁止更新组件，OOBE 也不许检查更新」，见下面「完全禁止 Windows 更新」组。
         $servicesToDisable = @(
             # ---- 用户点名：禁用 Windows 安全中心 + Defender 全家 ----
             # WinDefend               = Defender 主服务（实时防护/扫描）
@@ -734,6 +770,14 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
             # 全部 Start=4 → 安全中心页面打不开、托盘不再弹提醒，等于事实上的卸载；
             # 真正的「卸载」（移除 SecHealthUI 应用包）在下面 4c 的在线清理里做。
             'WinDefend', 'WdNisSvc', 'SecurityHealthService', 'Sense',
+            # ---- 用户点名：彻底关掉 Windows 更新（OOBE 会强制检查更新的元凶）----
+            # wuauserv      = Windows Update 主服务，「检查更新」全靠它
+            # UsoSvc        = Update Orchestrator，OOBE 的「正在检查更新」走的就是它
+            # WaaSMedicSvc  = Windows Update Medic，**会偷偷把上面两个改回自动**
+            #                 —— 不一起禁用的话，前两个分分钟被它恢复
+            # DoSvc         = Delivery Optimization（更新 P2P 分发）
+            # 刻意不禁 BITS：商店/winget 的应用分发也走它，禁了会把商店搞坏。
+            'wuauserv', 'UsoSvc', 'WaaSMedicSvc', 'DoSvc',
             # 遥测 / 诊断 / 错误报告
             'DiagTrack', 'dmwappushservice', 'DPS', 'WerSvc', 'PcaSvc',
             'WdiServiceHost', 'WdiSystemHost', 'Wecsvc',
@@ -850,21 +894,30 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                     @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\System"; Name = 'EnableTaskScheduler'; Value = 1; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\Explorer"; Name = 'NoAutoplayfornon-volume devices'; Value = 1; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\Policies\Explorer"; Name = 'NoDriveTypeAutoRun'; Value = 255; Type = 'DWord' },
-                    # ---- 禁止自动更新（用户硬需求：装完和 OOBE 都不能自己更）----
-                    # NoAutoUpdate=1  → 彻底关掉"自动检查/下载/安装"，但设置里手动
-                    #                   "检查更新"仍然可用（手动更新能力保留）；
-                    # AUOptions=2     → 万一策略被绕过，也只允许"通知下载并通知安装"；
-                    # AutoInstallMinorUpdates=0 → 连小更新都不许悄悄装；
-                    # Defer 400 天    → 功能更新/质量更新推迟到 400 天（约等于永不来）；
-                    # NoAutoRebootWithLoggedOnUsers=1 → 就算有更新也不许自动重启；
-                    # ExcludeWUDriversInQualityUpdate=1 → Windows Update 不自动装驱动。
+                    # ---- 彻底禁止 Windows 更新（用户 2026-10-07 明确要求「删除并
+                    #      完全禁止更新组件，OOBE 也不可以更新」）----
+                    # 旧版只写 NoAutoUpdate=1 + AUOptions=2，实测**管不住 OOBE 的
+                    # 「正在检查更新」**：OOBE 走的是 UpdateOrchestrator 那条路，
+                    # 根本不看 AU 策略。所以这次三层一起下手：
+                    #   ① 服务 Start=4（wuauserv/UsoSvc/WaaSMedicSvc/DoSvc，见第 3 步）
+                    #   ② 策略硬禁（下面这些）
+                    #   ③ 删掉更新组件本体和全部更新相关计划任务（4c/4d + 在线清理）
+                    # AUOptions=1     → 「从不检查更新」（旧值 2 = 通知下载，仍会检查）
+                    # DisableWindowsUpdateAccess=1            → 设置里 Windows 更新被禁用
+                    # DoNotConnectToWindowsUpdateInternetLocations=1 → 连 WU 服务器都不连
+                    # SetDisableUXWUAccess=1                  → 隐藏/禁用更新 UX 入口
                     @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate\AU"; Name = 'NoAutoUpdate'; Value = 1; Type = 'DWord' },
-                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate\AU"; Name = 'AUOptions'; Value = 2; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate\AU"; Name = 'AUOptions'; Value = 1; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate\AU"; Name = 'AutoInstallMinorUpdates'; Value = 0; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate"; Name = 'DisableWindowsUpdateAccess'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate"; Name = 'DoNotConnectToWindowsUpdateInternetLocations'; Value = 1; Type = 'DWord' },
+                    @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate"; Name = 'SetDisableUXWUAccess'; Value = 1; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate"; Name = 'DeferFeatureUpdatesPeriodInDays'; Value = 400; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate"; Name = 'DeferQualityUpdatesPeriodInDays'; Value = 400; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate"; Name = 'NoAutoRebootWithLoggedOnUsers'; Value = 1; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Policies\Microsoft\Windows\WindowsUpdate"; Name = 'ExcludeWUDriversInQualityUpdate'; Value = 1; Type = 'DWord' },
+                    # 老式 Automatic Updates 键（部分组件还在读）
+                    @{ Path = "$hiveLabel\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update"; Name = 'NoAutoUpdate'; Value = 1; Type = 'DWord' },
                     # 应用商店也不许自己更新（否则被删的预装应用可能被商店推回来）
                     @{ Path = "$hiveLabel\Policies\Microsoft\WindowsStore"; Name = 'DisableAutoUpdate'; Value = 1; Type = 'DWord' },
                     @{ Path = "$hiveLabel\Policies\Microsoft\Windows\DeliveryOptimization"; Name = 'DownloadMode'; Value = 0; Type = 'DWord' },
@@ -974,12 +1027,32 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
         # ---- 4c. 删掉会自己跑更新的计划任务 ----
         # 策略（NoAutoUpdate）只管"Windows Update 主程序"，计划任务是另一条触发路径。
         # 直接删 Tasks 目录下的任务文件即可，离线状态最省事，且只删更新/遥测类，
-        # 不碰磁盘整理、系统诊断、Defender 扫描这些正经任务。
+        # 不碰磁盘整理、系统诊断这些正经任务。
+        # ⚠ 离线挂载时 Windows\System32\Tasks **经常是空的**（任务文件要等系统起来
+        #   才由 Task Scheduler 生成），所以这里多半一条都删不到 —— 真正生效的是
+        #   Cleanup.ps1 里在线补删 + 按目录枚举的那一份。这里保留着，能删就删。
         $tasksDir = Join-Path $mnt 'Windows\System32\Tasks\Microsoft\Windows'
+        # ① 按目录整棵删（UpdateOrchestrator / WaaSMedic / WindowsUpdate 下全是更新相关）
+        foreach ($d in @('WindowsUpdate', 'UpdateOrchestrator', 'WaaSMedic')) {
+            $dp = Join-Path $tasksDir $d
+            if (-not (Test-Path -LiteralPath $dp)) { continue }
+            Get-ChildItem -LiteralPath $dp -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+                    Write-Info "已删除计划任务: $d\$($_.Name)"
+                } catch { Write-Warning "删除计划任务 $d\$($_.Name) 失败: $_" }
+            }
+        }
+        # ② 按文件名删（老布局 + 遥测类）
         $taskFiles = @(
             'WindowsUpdate\Scheduled Start',          # ⭐ 例行 Windows 更新（会自动下载安装）
             'WindowsUpdate\Orchestrator\USO_UxBroker',# 更新编排器
             'WindowsUpdate\Orchestrator\UpdateOrchestrator',
+            'UpdateOrchestrator\Schedule Scan',       # Windows 11 的真实路径
+            'UpdateOrchestrator\Schedule Work',
+            'UpdateOrchestrator\USO_UxBroker',
+            'WaaSMedic\PerformRepairs',               # WU Medic 会把服务改回来
+            'WaaSMedic\Reboot',
             'Automatic App Update',                   # 商店应用自动更新
             'Maps\MapsToastTask', 'Maps\MapsUpdateTask',
             'Customer Experience Improvement Program\Consolidator',
@@ -996,6 +1069,37 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
                     Write-Info "已删除计划任务: $t"
                 } catch { Write-Warning "删除计划任务 $t 失败: $_" }
             }
+        }
+
+        # ---- 4d. 删除 Windows 更新组件本体（用户要求「删除并完全禁止更新组件」）----
+        # 三层里的最后一层：服务禁用 + 策略是主防线，这里把「更新引擎二进制」直接删掉，
+        # 保证哪天服务被 WU Medic / 人为改回自动也**起不来**。
+        # 每个文件都先 takeown/icacls —— 离线镜像里 System32 归 TrustedInstaller 所有，
+        # 不改属主删不动。全部带存在性判断，缺一个不影响别的。
+        # 只删纯 Windows Update 的文件，不碰 wuapi.dll / Settings 提供程序，避免把
+        # 设置应用和商店的通用更新 API 一起搞崩。
+        $wuFiles = @(
+            'Windows\System32\usoclient.exe',     # Update Session Orchestrator 客户端（OOBE「检查更新」的入口）
+            'Windows\System32\wuaueng.dll',       # Windows Update 引擎本体
+            'Windows\System32\wuaucpl.cpl'        # 旧版「Windows 更新」控制面板项
+        )
+        foreach ($f in $wuFiles) {
+            $fp = Join-Path $mnt $f
+            if (-not (Test-Path -LiteralPath $fp)) { continue }
+            try {
+                & takeown.exe /F $fp 2>&1 | Out-Null
+                & icacls.exe $fp /grant '*S-1-5-32-545:F' /C 2>&1 | Out-Null
+                Remove-Item -LiteralPath $fp -Force -ErrorAction Stop
+                Write-Info "已删除更新组件: $f"
+            } catch { Write-Warning "删除更新组件 $f 失败: $_" }
+        }
+        # 更新下载缓存（离线镜像里一般还没生成，存在的顺手删掉）
+        $wuCache = Join-Path $mnt 'Windows\SoftwareDistribution'
+        if (Test-Path -LiteralPath $wuCache) {
+            try {
+                Remove-Item -LiteralPath $wuCache -Recurse -Force -ErrorAction Stop
+                Write-Info '已删除更新缓存: Windows\SoftwareDistribution'
+            } catch { Write-Warning "删除 SoftwareDistribution 失败: $_" }
         }
 
         # ---- 4b. DEFAULT 用户 hive：新用户首次登录的 HKCU 默认值 ----
@@ -1065,63 +1169,102 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
             }
         }
 
-        # ---- 5. 写入 SetupComplete.cmd + Cleanup.ps1 + Activate.cmd + FirstBoot.ps1 ----
+        # ---- 5. 写入 Register.cmd + SetupComplete.cmd + Cleanup.ps1 + Activate.cmd + FirstBoot.ps1 ----
+        $firstBootDir = Join-Path $mnt 'FirstBoot'
+        New-Item -ItemType Directory -Force -Path $firstBootDir | Out-Null
+
+        # Register.cmd 是「注册阶段」的唯一属主，被两个互不相干的入口幂等调用：
+        #   ① autounattend.xml 的 specialize pass（Windows Setup 自己必然执行，SYSTEM）
+        #   ② SetupComplete.cmd（官方安装程序的经典钩子，首登之前跑）
+        # 任一个跑到了，两个计划任务 + RunOnce 进度窗就都在了 —— 这是上一版
+        # 「Office 没装 / 激活没成 / 四个 Appx 没删」三件事同时发生的唯一共同前置条件。
+        $registerCmd = Join-Path $firstBootDir 'Register.cmd'
+        $registerContent = @'
+@echo off
+REM ===== SYSTEM-Intel-MIC Register (idempotent, runs as SYSTEM) =====
+REM Entry points - either one is enough:
+REM   1) autounattend.xml specialize pass (Windows Setup, always runs)
+REM   2) SetupComplete.cmd (classic hook, right before first logon)
+REM Creates: task SYSTEM_Intel_MIC_Cleanup (ONLOGON)  - online debloat + appx
+REM          task SYSTEM_Intel_MIC_Activate (ONLOGON) - Office install + MAS
+REM          RunOnce -> FirstBoot.ps1 progress window at first logon
+REM Argument /run = start both tasks immediately (SetupComplete passes this).
+REM ONLOGON (not ONSTART) so the work restarts on every logon until it succeeds,
+REM then each task deletes itself.
+REM NOTE: this file is ASCII on purpose (cmd.exe cannot read UTF-8 comments).
+setlocal
+set FB=C:\FirstBoot
+set RUNNOW=0
+if /I "%~1"=="/run" set RUNNOW=1
+
+if exist "%FB%\Cleanup.ps1" (
+    echo [SYSTEM-Intel-MIC] Register task SYSTEM_Intel_MIC_Cleanup - ONLOGON
+    schtasks /Create /TN "SYSTEM_Intel_MIC_Cleanup" /TR "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File %FB%\Cleanup.ps1" /SC ONLOGON /RU SYSTEM /RL HIGHEST /F
+)
+if exist "%FB%\Activate.cmd" (
+    echo [SYSTEM-Intel-MIC] Register task SYSTEM_Intel_MIC_Activate - ONLOGON
+    schtasks /Create /TN "SYSTEM_Intel_MIC_Activate" /TR "cmd.exe /c %FB%\Activate.cmd" /SC ONLOGON /RU SYSTEM /RL HIGHEST /F
+)
+reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" /v SYSTEM_Intel_MIC_FirstBoot /t REG_SZ /d "powershell -NoProfile -ExecutionPolicy Bypass -File %FB%\FirstBoot.ps1" /f >nul 2>&1
+
+if not "%RUNNOW%"=="1" goto finish
+echo [SYSTEM-Intel-MIC] Starting both tasks now...
+schtasks /Run /TN "SYSTEM_Intel_MIC_Cleanup" >nul 2>&1
+if errorlevel 1 start "" /B powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File %FB%\Cleanup.ps1
+schtasks /Run /TN "SYSTEM_Intel_MIC_Activate" >nul 2>&1
+if errorlevel 1 start "" /B cmd /c %FB%\Activate.cmd
+
+:finish
+endlocal
+exit /b 0
+'@
+        # Ascii 写出：cmd.exe 不认 UTF-8 注释
+        Set-Content -LiteralPath $registerCmd -Value (Convert-ToCrlf $registerContent) -Encoding Ascii
+
         $scriptsDir = Join-Path $mnt 'Windows\Setup\Scripts'
         New-Item -ItemType Directory -Force -Path $scriptsDir | Out-Null
         $setupComplete = Join-Path $scriptsDir 'SetupComplete.cmd'
         # 为什么改用计划任务而不是 start /B：
         #   上一版 start /B 起的 Activate.cmd 是 SetupComplete 的子进程，用户只要在激活完成
         #   前重启一次，进程就被杀掉，而 RunOnce 也已经消费掉了 —— 结果就是「装完系统
-        #   Win 和 Office 都没激活」。改成 schtasks /SC ONSTART /RU SYSTEM 之后：
-        #     * 首次 SetupComplete 里手动 /Run 一次；
-        #     * 用户中途重启，下次开机计划任务自己再跑一遍；
-        #     * Office 没装完就由 Activate.cmd 重新拉起 setup.exe 续装；
-        #     * 全部成功后写 ACTIVATION_RESULT.txt 并自我删除任务，不留常驻。
+        #   Win 和 Office 都没激活」。改成 schtasks /SC ONLOGON /RU SYSTEM 之后：
+        #     * SetupComplete 里手动 /Run 一次（首登之前先跑起来）；
+        #     * 用户中途重启，下次登录计划任务自己再跑一遍；
+        #     * Office 没装完就由 Activate.cmd 同步重跑 setup.exe 续装；
+        #     * 拿到授权才写 ACTIVATION_RESULT.txt 并自我删除任务，不留常驻；
         # Cleanup.ps1 同理：入门 / Windows 备份 / OneDrive / Windows 安全中心这四个东西
         #   离线 provisioned 列表里根本不存在（日志 grep=0），只能装完系统在线删。
         $setupCompleteContent = @'
 @echo off
 REM ===== SYSTEM-Intel-MIC SetupComplete (runs as SYSTEM, right before first logon) =====
-REM 1) Register the ONLOGON cleanup task and start it right away.
-REM    Getstarted / WindowsBackup / SecHealthUI / OneDrive are staged packages that only
-REM    register at the FIRST interactive logon, so Cleanup.ps1 does the logon independent
-REM    work now and then waits for that logon before removing the apps.
-REM 2) Register ONSTART scheduled task that runs Activate.cmd - survives a reboot.
-REM    Office install + MAS activation are all owned by that single task.
-REM 3) Register RunOnce so FirstBoot.ps1 shows a progress window at first logon.
+REM This is only ONE of two hooks - the other is the specialize pass of
+REM autounattend.xml. Both call C:\FirstBoot\Register.cmd, so the tasks exist even
+REM if this file never runs (DISM++ / NTLite deploy, or Setup being interrupted).
 REM NOTE: this file is written as ASCII on purpose (cmd.exe cannot read UTF-8), so
 REM       every comment below must stay ASCII-only.
 
-if exist "C:\FirstBoot\Cleanup.ps1" (
-    echo [SYSTEM-Intel-MIC] Registering online cleanup task...
-    schtasks /Create /TN "SYSTEM_Intel_MIC_Cleanup" /TR "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\FirstBoot\Cleanup.ps1" /SC ONLOGON /RU SYSTEM /RL HIGHEST /F
-    echo [SYSTEM-Intel-MIC] Starting online cleanup now (it waits for the first logon)...
-    schtasks /Run /TN "SYSTEM_Intel_MIC_Cleanup"
-    if errorlevel 1 (
-        echo [SYSTEM-Intel-MIC] schtasks /Run failed, falling back to plain start
-        start "" /B powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\FirstBoot\Cleanup.ps1
-    )
-)
+if exist "C:\FirstBoot\Register.cmd" goto modern
+goto legacy
 
-if exist "C:\FirstBoot\Activate.cmd" (
-    echo [SYSTEM-Intel-MIC] Registering activator scheduled task...
-    schtasks /Create /TN "SYSTEM_Intel_MIC_Activate" /TR "cmd.exe /c C:\FirstBoot\Activate.cmd" /SC ONSTART /RU SYSTEM /RL HIGHEST /F
-    if not errorlevel 1 (
-        schtasks /Run /TN "SYSTEM_Intel_MIC_Activate"
-    ) else (
-        echo [SYSTEM-Intel-MIC] schtasks failed, falling back to plain start
-        start "" /B cmd /c C:\FirstBoot\Activate.cmd
-    )
-)
+:modern
+echo [SYSTEM-Intel-MIC] Registering first-boot tasks via Register.cmd...
+call "C:\FirstBoot\Register.cmd" /run
+goto finish
 
+:legacy
+REM Register.cmd missing - keep the old inline behaviour so nothing is lost.
+if exist "C:\FirstBoot\Cleanup.ps1" schtasks /Create /TN "SYSTEM_Intel_MIC_Cleanup" /TR "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\FirstBoot\Cleanup.ps1" /SC ONLOGON /RU SYSTEM /RL HIGHEST /F
+if exist "C:\FirstBoot\Cleanup.ps1" schtasks /Run /TN "SYSTEM_Intel_MIC_Cleanup"
+if exist "C:\FirstBoot\Cleanup.ps1" if errorlevel 1 start "" /B powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\FirstBoot\Cleanup.ps1
+if exist "C:\FirstBoot\Activate.cmd" schtasks /Create /TN "SYSTEM_Intel_MIC_Activate" /TR "cmd.exe /c C:\FirstBoot\Activate.cmd" /SC ONLOGON /RU SYSTEM /RL HIGHEST /F
+if exist "C:\FirstBoot\Activate.cmd" schtasks /Run /TN "SYSTEM_Intel_MIC_Activate"
+if exist "C:\FirstBoot\Activate.cmd" if errorlevel 1 start "" /B cmd /c C:\FirstBoot\Activate.cmd
 reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" /v SYSTEM_Intel_MIC_FirstBoot /t REG_SZ /d "powershell -NoProfile -ExecutionPolicy Bypass -File C:\FirstBoot\FirstBoot.ps1" /f
 
+:finish
 exit /b 0
 '@
-        Set-Content -LiteralPath $setupComplete -Value $setupCompleteContent -Encoding Ascii
-
-                $firstBootDir = Join-Path $mnt 'FirstBoot'
-        New-Item -ItemType Directory -Force -Path $firstBootDir | Out-Null
+        Set-Content -LiteralPath $setupComplete -Value (Convert-ToCrlf $setupCompleteContent) -Encoding Ascii
 
         # ---- Cleanup.ps1：装完系统后的在线清理（SYSTEM 身份）----
         # 为什么非得在线做：入门 / Windows 备份 / OneDrive / Windows 安全中心这四样
@@ -1238,6 +1381,19 @@ foreach ($n in @('DisableAntiSpyware', 'DisableAntiVirus')) {
 }
 try { Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection' -Name 'DisableRealtimeMonitoring' -Value 1 -Type DWord } catch { }
 
+# --- 1b. 彻底关掉 Windows 更新（用户 2026-10-07：「删除并完全禁止更新组件」）---
+#     离线 hive 里已经写过 Start=4 了，这里在线再钉一次 —— 因为 WaaSMedicSvc
+#     （Windows Update Medic）的职责就是「发现更新服务被关掉就改回来」，
+#     它还带服务恢复机制会自动拉起，光离线写一次不够保险。
+#     UsoSvc = Update Orchestrator，OOBE 的「正在检查更新」走的就是它。
+foreach ($svc in @('wuauserv', 'UsoSvc', 'WaaSMedicSvc', 'DoSvc')) {
+    try {
+        Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+        Set-Service  -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+        L "update service disabled: $svc"
+    } catch { L "update service fail: $svc $_" }
+}
+
 # --- 2. OneDrive：跑官方卸载器 + 清残留 + 删 Run 触发值（与登录无关）---
 foreach ($setup in @("$env:windir\System32\OneDriveSetup.exe",
                      "$env:windir\SysWOW64\OneDriveSetup.exe")) {
@@ -1287,6 +1443,16 @@ foreach ($t in @(
     '\Microsoft\Windows\WindowsUpdate\Orchestrator\UpdateOrchestrator',
     '\Microsoft\Windows\WindowsUpdate\Automatic App Update',
     '\Microsoft\Windows\Automatic App Update',
+    '\Microsoft\Windows\UpdateOrchestrator\Schedule Scan',
+    '\Microsoft\Windows\UpdateOrchestrator\Schedule Scan Static Task',
+    '\Microsoft\Windows\UpdateOrchestrator\Schedule Work',
+    '\Microsoft\Windows\UpdateOrchestrator\Maintain Enable',
+    '\Microsoft\Windows\UpdateOrchestrator\Refresh Settings',
+    '\Microsoft\Windows\UpdateOrchestrator\Policy Install',
+    '\Microsoft\Windows\UpdateOrchestrator\Backup Boot Scan',
+    '\Microsoft\Windows\UpdateOrchestrator\USO_UxBroker',
+    '\Microsoft\Windows\WaaSMedic\PerformRepairs',
+    '\Microsoft\Windows\WaaSMedic\Reboot',
     '\Microsoft\Windows\Maps\MapsToastTask',
     '\Microsoft\Windows\Maps\MapsUpdateTask',
     '\Microsoft\Windows\Customer Experience Improvement Program\Consolidator',
@@ -1296,6 +1462,19 @@ foreach ($t in @(
     '\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector')) {
     & schtasks.exe /Delete /TN $t /F 2>&1 | Out-Null
     if ($LASTEXITCODE -eq 0) { L "task deleted: $t" }
+}
+# 再按目录整棵枚举一遍，把上面名字写漏的更新任务一并清掉
+foreach ($tp in @('\Microsoft\Windows\WindowsUpdate\',
+                  '\Microsoft\Windows\UpdateOrchestrator\',
+                  '\Microsoft\Windows\WaaSMedic\')) {
+    try {
+        foreach ($t in @(Get-ScheduledTask -TaskPath $tp -ErrorAction SilentlyContinue)) {
+            try {
+                Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $tp -Confirm:$false -ErrorAction Stop
+                L "task deleted: $tp$($t.TaskName)"
+            } catch { L "task delete fail: $tp$($t.TaskName) $_" }
+        }
+    } catch { L "Get-ScheduledTask fail on $tp $_" }
 }
 
 # --- 4. 等待第一次交互式登录（最多 45 分钟）---
@@ -1333,6 +1512,24 @@ if ($logonSeen) {
     }
 }
 
+# --- 6. 补刀：激活器还没出结果就再拉它一次 -------------------------------
+#     SetupComplete 的 /Run 可能因为任务还没注册好、或者当时没网 30 分钟超时
+#     退出而漏掉。这里在**第一次登录之后**兜底再 /Run 一次；激活器自己是幂等的
+#     （有结果标记直接退出、没拿到授权就留着标记等下次登录），重复调用无副作用。
+if (Test-Path -LiteralPath "$base\ACTIVATION_RESULT.txt") {
+    L 'activation result already present, no kick needed'
+} else {
+    Start-Sleep -Seconds 30
+    if (Test-Path -LiteralPath "$base\ACTIVATION_RESULT.txt") {
+        L 'activation result appeared meanwhile, no kick needed'
+    } elseif (Test-Path -LiteralPath "$base\Activate.cmd") {
+        & schtasks.exe /Run /TN 'SYSTEM_Intel_MIC_Activate' 2>&1 | Out-Null
+        L "kicked SYSTEM_Intel_MIC_Activate (no result marker yet, schtasks rc=$LASTEXITCODE)"
+    } else {
+        L 'C:\FirstBoot\Activate.cmd missing, cannot kick the activator'
+    }
+}
+
 # --- 6. 收尾：释放锁；只有「确认见过登录」才写完成标记并自我删除任务 ---
 Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
 if (-not $logonSeen) {
@@ -1344,7 +1541,7 @@ schtasks.exe /Delete /TN 'SYSTEM_Intel_MIC_Cleanup' /F 2>&1 | Out-Null
 L '=== online cleanup finished: CLEANUP_DONE written, task self-deleted ==='
 '@
         # UTF8BOM：由 Windows PowerShell 5.1 执行，无 BOM 的 UTF-8 会被当成 ANSI 解码
-        Set-Content -LiteralPath $cleanupPs1 -Value $cleanupContent -Encoding UTF8BOM
+        Set-Content -LiteralPath $cleanupPs1 -Value (Convert-ToCrlf $cleanupContent) -Encoding UTF8BOM
 
         # ---- Activate.cmd：SYSTEM 后台跑的激活器 ----
         # 为什么不在 FirstBoot.ps1 里直接跑 MAS：
@@ -1354,14 +1551,18 @@ L '=== online cleanup finished: CLEANUP_DONE written, task self-deleted ==='
         # 所以交给 SetupComplete 起的 SYSTEM 后台进程，按顺序等两件事再跑 MAS，
         # 结果写成标记文件，前台的 FirstBoot.ps1 只负责显示。
         $activateCmd = Join-Path $firstBootDir 'Activate.cmd'
-        # 由计划任务 SYSTEM_Intel_MIC_Activate（ONSTART / SYSTEM）拉起，
-        # 所以「用户中途重启」不再会把激活打断：下次开机会自己重跑，
-        # Office 没装完就重新拉 setup.exe 续装，全部成功后写结果标记并自我删除任务。
+        # 由计划任务 SYSTEM_Intel_MIC_Activate（ONLOGON / SYSTEM）拉起，
+        # 所以「用户中途重启」不再会把激活打断：下次登录自己重跑，
+        # Office 没装完就同步重跑 setup.exe 续装，没拿到授权就留着结果标记不写、
+        # 下次登录再试（最多 5 次），成功后才自我删除任务。
         $activateContent = @'
 REM ===== SYSTEM-Intel-MIC Activate (SYSTEM, task SYSTEM_Intel_MIC_Activate) =====
 REM 0) already finished -> delete own task and exit
-REM 1) Office install - (re)launch setup.exe, survives a reboot
+REM 1) Office install - synchronous setup.exe /configure with a 20 min cap
 REM 2) wait for network -> MAS unattended (/HWID + /Ohook) -> write result marker
+REM 3) not licensed yet -> leave the marker unwritten, retry on the next logon
+REM       (max 5 attempts), so a machine that had no network on first boot still
+REM       ends up activated.
 REM NOTE: the online cleanup (Getstarted / WindowsBackup / OneDrive / SecHealthUI) is
 REM       owned by task SYSTEM_Intel_MIC_Cleanup (ONLOGON), NOT by this script.
 setlocal enabledelayedexpansion
@@ -1369,6 +1570,9 @@ set LOG=C:\FirstBoot\activation.log
 set RES=C:\FirstBoot\ACTIVATION_RESULT.txt
 set WAITED=0
 set LAUNCHES=0
+set POLL=0
+set TRIES=0
+if exist "C:\FirstBoot\ACT_TRY" set /p TRIES=<"C:\FirstBoot\ACT_TRY"
 set ONLINE=0
 set HWIDCODE=NA
 set OHOOKCODE=NA
@@ -1378,7 +1582,15 @@ set OFFICE=SKIP
 if exist "%RES%" goto selfdelete
 echo [%date% %time%] activator start >> "%LOG%"
 
-REM --- 1) Office install: check install state first, launch setup when idle ---
+REM --- 1) Office install: synchronous + 20 min cap per attempt ---
+REM     The previous version used `start "" /MIN setup.exe /configure ...`.
+REM     The task runs as /RU SYSTEM in the NON-INTERACTIVE session 0 window
+REM     station, where `start` silently does nothing - no window, no process -
+REM     and after 5 tries it just wrote OFFICE=SKIP. That is exactly why
+REM     "Office never got installed". Switched to a direct synchronous call
+REM     (the same way SCCM/Intune deploy Office C2R) with PowerShell
+REM     WaitForExit(1200) as a hard cap, so a hung setup.exe cannot stall
+REM     the whole activation flow.
 :office
 if exist "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE" goto officeok
 if exist "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE" goto officeok
@@ -1386,23 +1598,38 @@ if not exist "C:\OfficeInstall\setup.exe" goto officedone
 tasklist /FI "IMAGENAME eq setup.exe" 2>nul | find /I "setup.exe" >nul
 if not errorlevel 1 goto officewait
 set /a LAUNCHES+=1
-if !LAUNCHES! gtr 5 goto officedone
-echo [%date% %time%] starting Office setup, try !LAUNCHES! >> "%LOG%"
-start "" /MIN "C:\OfficeInstall\setup.exe" /configure "C:\OfficeInstall\configuration.xml"
-ping -n 6 127.0.0.1 >nul
+if !LAUNCHES! gtr 3 goto officefail
+set POLL=0
+echo [%date% %time%] Office setup attempt !LAUNCHES! synchronous with 20 min cap >> "%LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Start-Process -FilePath 'C:\OfficeInstall\setup.exe' -ArgumentList '/configure','C:\OfficeInstall\configuration.xml' -PassThru -WindowStyle Hidden; if ($p.WaitForExit(1200)) { 'setup exit code: ' + $p.ExitCode } else { $p.Kill(); 'setup did not finish in 20 minutes, killed' }" >> "%LOG%" 2>&1
+REM setup.exe has returned; the C2R stack may still need a moment to register the
+REM appx/file associations. Poll WINWORD.EXE for up to 6 minutes before concluding
+REM the attempt failed - otherwise a fast-returning setup.exe would burn all 3
+REM attempts in a few seconds and give up on a perfectly good install.
+:officepoll
+ping -n 16 127.0.0.1 >nul
+if exist "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE" goto officeok
+if exist "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE" goto officeok
+set /a POLL+=1
+if !POLL! lss 24 goto officepoll
+goto office
 :officewait
 set /a WAITED+=1
 if %WAITED% gtr 360 goto officetimeout
 ping -n 16 127.0.0.1 >nul
 goto office
+:officefail
+echo [%date% %time%] Office install failed after 3 attempts >> "%LOG%"
+goto officedone
+:officetimeout
+echo [%date% %time%] Office setup.exe still running after 90 min, giving up >> "%LOG%"
+goto officedone
 :officeok
 set OFFICE=OK
 echo [%date% %time%] Office installed >> "%LOG%"
 goto officedone
-:officetimeout
-echo [%date% %time%] Office install timed out after 90 min >> "%LOG%"
 :officedone
-if exist "C:\FirstBoot\OFFICE_DONE" goto officemarked
+if exist "C:\FirstBoot\OFFICE_DONE" if "%OFFICE%"=="SKIP" goto officemarked
 echo %OFFICE% %date% %time% > "C:\FirstBoot\OFFICE_DONE"
 :officemarked
 
@@ -1451,28 +1678,53 @@ if exist "C:\OfficeInstall" echo [%date% %time%] OfficeInstall prune failed >> "
 if not exist "C:\OfficeInstall" echo [%date% %time%] OfficeInstall pruned, freed 3.6 GB >> "%LOG%"
 
 :reswrite
-REM --- 6) Result marker read by FirstBoot.ps1 ---
+REM --- 6) Retry policy -------------------------------------------------------
+REM     Only write the result marker when Windows actually got a license.
+REM     Otherwise the marker is DELIBERATELY left unwritten, so the ONLOGON
+REM     task simply runs again at the next logon (typical case: no Wi-Fi yet
+REM     on first boot, the 30 min network wait times out, and the retry after
+REM     the user connects lands it). Bounded by 5 attempts so the task never
+REM     becomes a permanent fixture when activation genuinely cannot work.
+if "%WIN_LICENSE%"=="1" goto finalize
+set /a TRIES+=1
+> "C:\FirstBoot\ACT_TRY" echo(!TRIES!
+if !TRIES! lss 5 goto trylater
+echo [%date% %time%] giving up after !TRIES! attempts >> "%LOG%"
+goto finalize
+:trylater
+REM NOTE: the task is NOT deleted here on purpose - the ONLOGON trigger stays
+REM       registered so the next logon runs this script again.
+echo [%date% %time%] not licensed yet, attempt !TRIES! of 5, will retry on next logon >> "%LOG%"
+endlocal
+exit /b 0
+
+:finalize
+REM --- 7) Result marker read by FirstBoot.ps1 ---
+REM     NOTE: redirect goes FIRST on every line: `echo HWID_EXIT=1>> file` would be
+REM     parsed by cmd as "redirect handle 1 to file" because the value ends in a
+REM     digit, silently dropping the value. Leading `>>` removes that ambiguity.
 if %ONLINE% equ 1 goto resonline
-echo NETWORK=OFFLINE> "%RES%"
+> "%RES%" echo NETWORK=OFFLINE
 goto resdone
 :resonline
-echo NETWORK=OK> "%RES%"
+> "%RES%" echo NETWORK=OK
 :resdone
-echo OFFICE=%OFFICE%>> "%RES%"
-echo HWID_EXIT=!HWIDCODE!>> "%RES%"
-echo OHOOK_EXIT=!OHOOKCODE!>> "%RES%"
-echo WIN_LICENSE=!WIN_LICENSE!>> "%RES%"
-echo DONE>> "%RES%"
+>> "%RES%" echo OFFICE=%OFFICE%
+>> "%RES%" echo HWID_EXIT=!HWIDCODE!
+>> "%RES%" echo OHOOK_EXIT=!OHOOKCODE!
+>> "%RES%" echo WIN_LICENSE=!WIN_LICENSE!
+>> "%RES%" echo DONE
 echo [%date% %time%] activator finished, WIN_LICENSE=!WIN_LICENSE! >> "%LOG%"
 
 :selfdelete
 schtasks /Delete /TN "SYSTEM_Intel_MIC_Activate" /F >nul 2>&1
+del "C:\FirstBoot\ACT_TRY" >nul 2>&1
 endlocal
 exit /b 0
 
 '@
         # Ascii 写出：Activate.cmd 里全是英文注释，杜绝编码歧义
-        Set-Content -LiteralPath $activateCmd -Value $activateContent -Encoding Ascii
+        Set-Content -LiteralPath $activateCmd -Value (Convert-ToCrlf $activateContent) -Encoding Ascii
 
         $firstBootPs1 = Join-Path $firstBootDir 'FirstBoot.ps1'
         $firstBootContent = @'
@@ -1639,7 +1891,7 @@ try { $runspace.Dispose() } catch { <# ignore #> }
 '@
         # utf8BOM：FirstBoot.ps1 由 RunOnce 里的 Windows PowerShell 5.1 执行，
         # 无 BOM 的 UTF-8 会被 5.1 当成 ANSI 解码，中文会变乱码
-        Set-Content -LiteralPath $firstBootPs1 -Value $firstBootContent -Encoding UTF8BOM
+        Set-Content -LiteralPath $firstBootPs1 -Value (Convert-ToCrlf $firstBootContent) -Encoding UTF8BOM
 
 
         # ---- 6. 如果需要，下载 Office ODT + MAS ----
