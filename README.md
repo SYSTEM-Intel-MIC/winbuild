@@ -524,6 +524,12 @@ Hyper-V 与 WSL。清单里的关键词**匹配不到就跳过**，不会报错�
 | ② 策略 | 下表全部键 | 离线 SOFTWARE hive（⑧） |
 | ③ 组件本体 | 删除 `usoclient.exe` `wuaueng.dll` `wuaucpl.cpl` + `Windows\SoftwareDistribution` 缓存 | 离线 ⑧c，`Cleanup.ps1` 在线再删一遍更新计划任务 |
 
+> **执行条件（说清楚，免得误解成"万能"）**：①③ 两层写在 `Invoke-OfflineCustomization` 里，
+> 只要 `deep_debloat` / `perf_tweaks` / `office_offline` / `mas_activate` **任一**开启就会执行
+> （四个默认全开，所以正常构建必然包含）。唯一落空的情况是四个开关**全关**（= 完全不精简），
+> 那种情况下仍会执行「无人值守」一节里的 `windowsPE` AU 策略（那条是真正无条件的）。
+> ①③④层与 `updates` 输入开关**完全无关** —— `updates` 只决定要不要离线集成 LCU。
+
 | 键 | 值 | 原因 |
 |---|---|---|
 | `Policies\Microsoft\Windows\WindowsUpdate\AU` | `NoAutoUpdate=1` | **关掉自动检查/下载/安装** |
@@ -551,8 +557,9 @@ Hyper-V 与 WSL。清单里的关键词**匹配不到就跳过**，不会报错�
 > 与 Settings 的更新提供程序 —— 那是通用 API 表面，删了会连带把设置应用/商店搞崩。
 >
 > **⚠ `updates` 输入开关只决定「是否离线集成最新累积更新（LCU）」**，
-> 与上面的「删除并禁止更新组件」**无关**（后者是恒定行为）。就算 `updates=true`
-> 把 LCU 打进镜像，系统跑起来后也不会再自己检查/下载任何更新。
+> 与上面的「删除并禁止更新组件」**无关**（后者由精简开关决定，四个默认全开 → 必然执行）。
+> 就算 `updates=true` 把 LCU 打进镜像，系统跑起来后也不会再自己检查/下载任何更新 ——
+> 想要"装完就到此为止，以后永远不更新"，`updates` 保持默认 `false` 即可。
 
 #### 广告 / 推广 / 预留空间 / 活动历史
 
