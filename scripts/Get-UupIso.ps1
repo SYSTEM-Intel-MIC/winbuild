@@ -377,6 +377,13 @@ function New-UnattendXml {
                 $syncCmds += @{ d = 'AutoInstallMinorUpdates'; p = (& $peWrap 'reg add HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU /v AutoInstallMinorUpdates /t REG_DWORD /d 0 /f') }
             }
             $x += '    <component name="Microsoft-Windows-Setup" ' + $cp + '>'
+            # Setup 自身的 Dynamic Update：明确关闭，避免安装阶段拉取 SetupDU/SafeOSDU/LCU。
+            if ($blockUpdates) {
+                $x += '      <DynamicUpdate>'
+                $x += '        <Enable>false</Enable>'
+                $x += '        <WillShowUI>Never</WillShowUI>'
+                $x += '      </DynamicUpdate>'
+            }
             $x += '      <RunSynchronous>'
             $n = 0
             foreach ($c in $syncCmds) {
@@ -441,6 +448,7 @@ function New-UnattendXml {
             $x += '        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>'
             $x += '        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>'
             $x += '        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>'
+            # ProtectYourPC=3 是 OOBE Express Settings/隐私行为，不是 Windows Update 开关。
             $x += '        <ProtectYourPC>3</ProtectYourPC>'
             $x += '      </OOBE>'
         }
@@ -760,7 +768,7 @@ function Invoke-OfflineCustomization([string] $Tree, [string] $BuildDir) {
         # 注意：WinDefend/WdNisSvc/SecurityHealthService/Sense（Windows 安全中心 + Defender）
         # **已经不再保留** —— 用户明确要求禁用并卸载安全中心，见下面「安全中心 / Defender」组。
         # 2026-10-07 起 wuauserv(Windows 更新) **也不再保留** —— 用户明确要求
-        # 「删除并完全禁止更新组件，OOBE 也不许检查更新」，见下面「完全禁止 Windows 更新」组。
+        # 「删除并完全禁止更新组件，OOBE 阶段不应主动联网更新（需求目标；critical ZDP 仍需通过 OOBE 阶段无网络来可靠阻断）」，见下面「完全禁止 Windows 更新」组。
         $servicesToDisable = @(
             # ---- 用户点名：禁用 Windows 安全中心 + Defender 全家 ----
             # WinDefend               = Defender 主服务（实时防护/扫描）
@@ -1350,6 +1358,11 @@ function Test-TargetLeft {
 }
 
 L '=== online cleanup start ==='
+if (Test-Path -LiteralPath 'C:\FirstBoot\ACTIVATION_RESULT.txt') {
+    $raw = Get-Content -LiteralPath 'C:\FirstBoot\ACTIVATION_RESULT.txt' -ErrorAction SilentlyContinue
+    $lic = ($raw | Where-Object { $_ -like 'WIN_LICENSE=*' } | Select-Object -First 1) -replace '^WIN_LICENSE=',''
+    if ($lic -ne '1') { L "activation result exists but Windows is not licensed: WIN_LICENSE=$lic" }
+}
 if (Test-Path -LiteralPath $doneMarker) { L 'CLEANUP_DONE already exists, exit'; exit 0 }
 
 # --- 0. 单实例锁（ONLOGON 触发器与 SetupComplete 的 /Run 可能撞车）---
@@ -1389,7 +1402,7 @@ try { Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender
 #     离线 hive 里已经写过 Start=4 了，这里在线再钉一次 —— 因为 WaaSMedicSvc
 #     （Windows Update Medic）的职责就是「发现更新服务被关掉就改回来」，
 #     它还带服务恢复机制会自动拉起，光离线写一次不够保险。
-#     UsoSvc = Update Orchestrator，OOBE 的「正在检查更新」走的就是它。
+#     UsoSvc = Update Orchestrator；禁用它可阻止常规更新编排，但不能把 Windows 11 OOBE 的 critical ZDP 更新视为单纯的 UsoSvc/AU 流程。
 foreach ($svc in @('wuauserv', 'UsoSvc', 'WaaSMedicSvc', 'DoSvc')) {
     try {
         Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
@@ -1563,152 +1576,184 @@ L '=== online cleanup finished: CLEANUP_DONE written, task self-deleted ==='
         # 下次登录再试（最多 5 次），成功后才自我删除任务。
         $activateContent = @'
 REM ===== SYSTEM-Intel-MIC Activate (SYSTEM, task SYSTEM_Intel_MIC_Activate) =====
-REM 0) already finished -> delete own task and exit
-REM 1) Office install - synchronous setup.exe /configure with a 20 min cap
-REM 2) wait for network -> MAS unattended (/HWID + /Ohook) -> write result marker
-REM 3) not licensed yet -> leave the marker unwritten, retry on the next logon
-REM       (max 5 attempts), so a machine that had no network on first boot still
-REM       ends up activated.
-REM NOTE: the online cleanup (Getstarted / WindowsBackup / OneDrive / SecHealthUI) is
-REM       owned by task SYSTEM_Intel_MIC_Cleanup (ONLOGON), NOT by this script.
+REM State source of truth: C:\FirstBoot\status.json (atomic tmp -> Move-Item).
+REM Office install is intentionally synchronous during SetupComplete; no Kill() is used.
 setlocal enabledelayedexpansion
 set LOG=C:\FirstBoot\activation.log
 set RES=C:\FirstBoot\ACTIVATION_RESULT.txt
+set STATUS=C:\FirstBoot\status.json
 set WAITED=0
 set LAUNCHES=0
 set POLL=0
 set TRIES=0
 if exist "C:\FirstBoot\ACT_TRY" set /p TRIES=<"C:\FirstBoot\ACT_TRY"
+set /a TRIES+=1
 set ONLINE=0
 set HWIDCODE=NA
 set OHOOKCODE=NA
 set WIN_LICENSE=NA
 set OFFICE=SKIP
-
 if exist "%RES%" goto selfdelete
-echo [%date% %time%] activator start >> "%LOG%"
+echo [%date% %time%] activator start attempt !TRIES! >> "%LOG%"
 
-REM --- 1) Office install: synchronous + 20 min cap per attempt ---
-REM     The previous version used `start "" /MIN setup.exe /configure ...`.
-REM     The task runs as /RU SYSTEM in the NON-INTERACTIVE session 0 window
-REM     station, where `start` silently does nothing - no window, no process -
-REM     and after 5 tries it just wrote OFFICE=SKIP. That is exactly why
-REM     "Office never got installed". Switched to a direct synchronous call
-REM     (the same way SCCM/Intune deploy Office C2R) with PowerShell
-REM     WaitForExit(1200) as a hard cap, so a hung setup.exe cannot stall
-REM     the whole activation flow.
+:write_status
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$o=[ordered]@{schema=1;updated=(Get-Date).ToString('o');attempt=[int]$env:STATUS_ATTEMPT;office=$env:STATUS_OFFICE;office_activation=$env:STATUS_OFFICE_ACT;windows_activation=$env:STATUS_WIN_ACT;network=$env:STATUS_NET;hwid_exit=$env:STATUS_HWID;ohook_exit=$env:STATUS_OHOOK;win_license=$env:STATUS_LICENSE};$tmp='C:\FirstBoot\status.json.tmp';$o|ConvertTo-Json -Compress|Set-Content -LiteralPath $tmp -Encoding UTF8;Move-Item -LiteralPath $tmp -Destination 'C:\FirstBoot\status.json' -Force" >> "%LOG%" 2>&1
+exit /b 0
+
+:status_start
+set STATUS_ATTEMPT=!TRIES!
+set STATUS_OFFICE=installing
+set STATUS_OFFICE_ACT=pending
+set STATUS_WIN_ACT=waiting_network
+set STATUS_NET=unknown
+set STATUS_HWID=NA
+set STATUS_OHOOK=NA
+set STATUS_LICENSE=NA
+call :write_status
+
 :office
-if exist "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE" goto officeok
-if exist "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE" goto officeok
-if not exist "C:\OfficeInstall\setup.exe" goto officedone
+if exist "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE" goto office_candidate
+if exist "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE" goto office_candidate
+if not exist "C:\OfficeInstall\setup.exe" goto office_missing
 tasklist /FI "IMAGENAME eq setup.exe" 2>nul | find /I "setup.exe" >nul
-if not errorlevel 1 goto officewait
+if not errorlevel 1 goto office_existing
 set /a LAUNCHES+=1
 if !LAUNCHES! gtr 3 goto officefail
-set POLL=0
-echo [%date% %time%] Office setup attempt !LAUNCHES! synchronous with 20 min cap >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Start-Process -FilePath 'C:\OfficeInstall\setup.exe' -ArgumentList '/configure','C:\OfficeInstall\configuration.xml' -PassThru -WindowStyle Hidden; if ($p.WaitForExit(1200)) { 'setup exit code: ' + $p.ExitCode } else { $p.Kill(); 'setup did not finish in 20 minutes, killed' }" >> "%LOG%" 2>&1
-REM setup.exe has returned; the C2R stack may still need a moment to register the
-REM appx/file associations. Poll WINWORD.EXE for up to 6 minutes before concluding
-REM the attempt failed - otherwise a fast-returning setup.exe would burn all 3
-REM attempts in a few seconds and give up on a perfectly good install.
+echo [%date% %time%] Office setup attempt !LAUNCHES! synchronous, max 45 min >> "%LOG%"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p=Start-Process -FilePath 'C:\OfficeInstall\setup.exe' -ArgumentList '/configure','C:\OfficeInstall\configuration.xml' -PassThru -WindowStyle Hidden; if($p.WaitForExit(2700)){'setup exit code: '+$p.ExitCode}else{'setup still running after 45 minutes; leaving it alone'}" >> "%LOG%" 2>&1
+goto officepoll
+
+:office_existing
+set WAITED=0
+:office_existing_wait
+tasklist /FI "IMAGENAME eq setup.exe" 2>nul | find /I "setup.exe" >nul
+if errorlevel 1 goto officepoll
+set /a WAITED+=1
+if !WAITED! geq 180 goto officefail
+ping -n 11 127.0.0.1 >nul
+goto office_existing_wait
+
 :officepoll
+set POLL=0
+:officepoll_loop
 ping -n 16 127.0.0.1 >nul
+if exist "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE" goto office_candidate
+if exist "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE" goto office_candidate
+set /a POLL+=1
+if !POLL! lss 40 goto officepoll_failed
+goto officepoll_failed
+
+:office_candidate
+tasklist /FI "IMAGENAME eq setup.exe" 2>nul | find /I "setup.exe" >nul
+if not errorlevel 1 goto office_existing
+tasklist /FI "IMAGENAME eq OfficeClickToRun.exe" 2>nul | find /I "OfficeClickToRun.exe" >nul
+if not errorlevel 1 goto officeok
+set POLL=0
+:office_c2r_settle
+ping -n 11 127.0.0.1 >nul
 if exist "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE" goto officeok
 if exist "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE" goto officeok
 set /a POLL+=1
-if !POLL! lss 24 goto officepoll
-goto office
-:officewait
-set /a WAITED+=1
-if %WAITED% gtr 360 goto officetimeout
-ping -n 16 127.0.0.1 >nul
-goto office
-:officefail
-echo [%date% %time%] Office install failed after 3 attempts >> "%LOG%"
-goto officedone
-:officetimeout
-echo [%date% %time%] Office setup.exe still running after 90 min, giving up >> "%LOG%"
-goto officedone
+if !POLL! lss 12 goto office_c2r_settle
+goto officepoll_failed
+
 :officeok
 set OFFICE=OK
+set STATUS_OFFICE=installed
 echo [%date% %time%] Office installed >> "%LOG%"
-goto officedone
-:officedone
-if exist "C:\FirstBoot\OFFICE_DONE" if "%OFFICE%"=="SKIP" goto officemarked
-echo %OFFICE% %date% %time% > "C:\FirstBoot\OFFICE_DONE"
-:officemarked
+call :write_status
+goto waitnet
 
-REM --- 2) wait for network (26100+ HWID/TSforge needs it), max 30 min ---
-set WAITED=0
+:office_missing
+set OFFICE=SKIP
+set STATUS_OFFICE=failed
+echo [%date% %time%] Office source/setup missing >> "%LOG%"
+call :write_status
+goto waitnet
+
+:officefail
+set OFFICE=SKIP
+set STATUS_OFFICE=failed
+echo [%date% %time%] Office install failed after retries >> "%LOG%"
+call :write_status
+goto waitnet
+
+:officepoll_failed
+set OFFICE=SKIP
+set STATUS_OFFICE=failed
+echo [%date% %time%] Office install failed after retries >> "%LOG%"
+call :write_status
+goto waitnet
+
 :waitnet
+set WAITED=0
+:waitnet_loop
 ping -n 1 -w 2000 223.5.5.5 >nul 2>&1
 if not errorlevel 1 goto netok
 ping -n 1 -w 2000 114.114.114.114 >nul 2>&1
 if not errorlevel 1 goto netok
 set /a WAITED+=1
-if %WAITED% gtr 60 goto netgone
+if !WAITED! gtr 60 goto netgone
 ping -n 31 127.0.0.1 >nul
-goto waitnet
+goto waitnet_loop
+
 :netok
 set ONLINE=1
+set STATUS_NET=online
+set STATUS_WIN_ACT=running
+call :write_status
 echo [%date% %time%] network is up >> "%LOG%"
 goto dorun
+
 :netgone
-echo [%date% %time%] no network after 30 min, Office offline activation only >> "%LOG%"
+set STATUS_NET=offline
+set STATUS_WIN_ACT=waiting_network
+call :write_status
+echo [%date% %time%] no network after 30 min; Office offline activation only >> "%LOG%"
 
 :dorun
-REM --- 3) MAS unattended: any switch selects unattended mode (no menu, no keypress). ---
-REM     HWID and Ohook run as TWO separate calls so neither one gets skipped:
-REM       /HWID  = Windows digital license (needs network)
-REM       /Ohook = Office permanent activation (works offline)
 if %ONLINE% equ 1 call "C:\MAS\MAS_AIO.cmd" /HWID /S >> "%LOG%" 2>&1
 if %ONLINE% equ 1 set HWIDCODE=!errorlevel!
 call "C:\MAS\MAS_AIO.cmd" /Ohook /S >> "%LOG%" 2>&1
 set OHOOKCODE=!errorlevel!
+set STATUS_HWID=!HWIDCODE!
+set STATUS_OHOOK=!OHOOKCODE!
+call :write_status
 echo [%date% %time%] MAS exit: HWID=!HWIDCODE! OHOOK=!OHOOKCODE! >> "%LOG%"
-
-REM --- 4) Double check the real Windows license state via WMI (no GUI, no popup) ---
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance SoftwareLicensingProduct -Filter 'PartialProductKey IS NOT NULL AND LicenseStatus = 1' -ErrorAction SilentlyContinue | Select-Object -First 1; if ($p) { '1' } else { '0' }" > "%TEMP%\wl.txt" 2>&1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p=Get-CimInstance SoftwareLicensingProduct -Filter 'PartialProductKey IS NOT NULL AND LicenseStatus = 1' -ErrorAction SilentlyContinue | Select-Object -First 1; if($p){'1'}else{'0'}" > "%TEMP%\wl.txt" 2>&1
 findstr /r /x /c:"1" "%TEMP%\wl.txt" >nul 2>&1
 if not errorlevel 1 set WIN_LICENSE=1
 findstr /r /x /c:"0" "%TEMP%\wl.txt" >nul 2>&1
 if not errorlevel 1 set WIN_LICENSE=0
-
-REM --- 5) prune the ~3.6 GB offline Office source, but only when Office really landed ---
-if not "%OFFICE%" == "OK" goto reswrite
+set STATUS_LICENSE=!WIN_LICENSE!
+if not "%OFFICE%"=="OK" goto reswrite
 if not exist "C:\OfficeInstall\setup.exe" goto reswrite
-ping -n 21 127.0.0.1 >nul
+ping -n 61 127.0.0.1 >nul
 rmdir /s /q "C:\OfficeInstall" >> "%LOG%" 2>&1
 if exist "C:\OfficeInstall" echo [%date% %time%] OfficeInstall prune failed >> "%LOG%"
-if not exist "C:\OfficeInstall" echo [%date% %time%] OfficeInstall pruned, freed 3.6 GB >> "%LOG%"
+if not exist "C:\OfficeInstall" echo [%date% %time%] OfficeInstall pruned >> "%LOG%"
 
 :reswrite
-REM --- 6) Retry policy -------------------------------------------------------
-REM     Only write the result marker when Windows actually got a license.
-REM     Otherwise the marker is DELIBERATELY left unwritten, so the ONLOGON
-REM     task simply runs again at the next logon (typical case: no Wi-Fi yet
-REM     on first boot, the 30 min network wait times out, and the retry after
-REM     the user connects lands it). Bounded by 5 attempts so the task never
-REM     becomes a permanent fixture when activation genuinely cannot work.
 if "%WIN_LICENSE%"=="1" goto finalize
-set /a TRIES+=1
 > "C:\FirstBoot\ACT_TRY" echo(!TRIES!
 if !TRIES! lss 5 goto trylater
-echo [%date% %time%] giving up after !TRIES! attempts >> "%LOG%"
+set STATUS_WIN_ACT=max_retry
+set STATUS_OFFICE_ACT=failed
 goto finalize
+
 :trylater
-REM NOTE: the task is NOT deleted here on purpose - the ONLOGON trigger stays
-REM       registered so the next logon runs this script again.
-echo [%date% %time%] not licensed yet, attempt !TRIES! of 5, will retry on next logon >> "%LOG%"
+set STATUS_WIN_ACT=failed
+set STATUS_OFFICE_ACT=failed
+call :write_status
+echo [%date% %time%] not licensed yet, attempt !TRIES! of 5, retry on next logon >> "%LOG%"
 endlocal
 exit /b 0
 
 :finalize
-REM --- 7) Result marker read by FirstBoot.ps1 ---
-REM     NOTE: redirect goes FIRST on every line: `echo HWID_EXIT=1>> file` would be
-REM     parsed by cmd as "redirect handle 1 to file" because the value ends in a
-REM     digit, silently dropping the value. Leading `>>` removes that ambiguity.
+set STATUS_WIN_ACT=success
+if "%WIN_LICENSE%"=="1" set STATUS_OFFICE_ACT=success
+if not "%WIN_LICENSE%"=="1" set STATUS_OFFICE_ACT=failed
+call :write_status
 if %ONLINE% equ 1 goto resonline
 > "%RES%" echo NETWORK=OFFLINE
 goto resdone
@@ -1721,13 +1766,11 @@ goto resdone
 >> "%RES%" echo WIN_LICENSE=!WIN_LICENSE!
 >> "%RES%" echo DONE
 echo [%date% %time%] activator finished, WIN_LICENSE=!WIN_LICENSE! >> "%LOG%"
-
 :selfdelete
 schtasks /Delete /TN "SYSTEM_Intel_MIC_Activate" /F >nul 2>&1
 del "C:\FirstBoot\ACT_TRY" >nul 2>&1
 endlocal
 exit /b 0
-
 '@
         # Ascii 写出：Activate.cmd 里全是英文注释，杜绝编码歧义
         Set-Content -LiteralPath $activateCmd -Value (Convert-ToCrlf $activateContent) -Encoding Ascii
@@ -1772,37 +1815,40 @@ $null = $runspace.AddScript({
         return $null
     }
 
-    # 1) 等 Office 装完（标记由 SYSTEM 的 Activate.cmd 写）
-    #    上限 45 分钟：Office 离线安装实测 3~8 分钟，超过 45 分钟基本就是计划任务
-    #    压根没跑 —— 再干等下去窗口会长时间挂着，用户看着就是「首启卡死」。
-    $deadline = (Get-Date).AddMinutes(45)
-    while (-not (Test-Path -LiteralPath 'C:\FirstBoot\OFFICE_DONE') -and (Get-Date) -lt $deadline) {
-        $st.Status = '正在安装 Office 365 (Word/Excel/PowerPoint)，请勿关机或断电...'
-        Start-Sleep -Seconds 3
-    }
-    $officeDone = Test-Path -LiteralPath 'C:\FirstBoot\OFFICE_DONE'
-    if ($officeDone) {
-        $st.Status = 'Office 安装完成，正在联网激活 Windows + Office...（如还没上网，请先连 Wi-Fi）'
-    } else {
-        $st.Status = '正在激活 Windows + Office（等待联网并运行 MAS）...（如还没上网，请先连 Wi-Fi）'
-    }
-
-    # 2) 等激活结果（最多 45 分钟）。
-    #    重试策略：本轮拿不到授权时 Activate.cmd **故意不写**结果标记，只写
-    #    C:\FirstBoot\ACT_TRY 计数、把任务留到下次登录再跑。所以只要看见 ACT_TRY，
-    #    就说明这一轮已经收尾了（继续等只会白等到超时），立刻出结论收窗。
-    #    这是 2026-10-07 配合「激活失败重试」新增的早退分支，否则进度窗会挂满 45 分钟。
-    if ($officeDone) {
-        $deadline = (Get-Date).AddMinutes(45)
-        while (-not (Test-Path -LiteralPath $resultFile) -and (Get-Date) -lt $deadline) {
-            $st.Status = '正在联网激活 Windows + Office...（如还没上网，请先连 Wi-Fi，联网后会自动完成）'
-            Start-Sleep -Seconds 5
-            if (Test-Path -LiteralPath 'C:\FirstBoot\ACT_TRY') {
-                $st.Status = '本轮激活尝试已结束，正在生成结果...'
-                Start-Sleep -Seconds 5   # 给 Activate.cmd 写结果收尾留点时间
-                break
+    # 1) status.json is the single source of truth.
+    $deadline = (Get-Date).AddMinutes(60)
+    while ((Get-Date) -lt $deadline) {
+        $j = $null
+        try { if (Test-Path -LiteralPath 'C:\FirstBoot\status.json') {
+            $j = Get-Content -LiteralPath 'C:\FirstBoot\status.json' -Raw -ErrorAction Stop | ConvertFrom-Json
+        }} catch { $j = $null }
+        if ($j) {
+            switch ("$($j.office)") {
+                'installing' { $st.Status = '正在安装 Office 365 (Word/Excel/PowerPoint)，请勿关机或断电...' }
+                'installed'  { $st.Status = 'Office 安装完成，正在联网激活 Windows + Office...' }
+                'failed'     { $st.Status = '⚠ Office 安装失败；正在继续处理 Windows + Office 激活...' }
+                default      { $st.Status = '正在等待 SYSTEM 后台任务启动...' }
             }
         }
+        Start-Sleep -Seconds 3
+    }
+
+    # 2) 等最终结果；不再用 ACT_TRY 推断后台状态。
+    $deadline = (Get-Date).AddMinutes(45)
+    while (-not (Test-Path -LiteralPath $resultFile) -and (Get-Date) -lt $deadline) {
+        $j = $null
+        try { if (Test-Path -LiteralPath 'C:\FirstBoot\status.json') {
+            $j = Get-Content -LiteralPath 'C:\FirstBoot\status.json' -Raw -ErrorAction Stop | ConvertFrom-Json
+        }} catch { $j = $null }
+        if ($j) {
+            if ("$($j.office)" -eq 'installing') { $st.Status = '正在安装 Office 365...' }
+            elseif ("$($j.office)" -eq 'installed') { $st.Status = 'Office 已安装，正在联网激活 Windows + Office...' }
+            elseif ("$($j.office)" -eq 'failed') { $st.Status = '⚠ Office 安装失败，正在继续完成激活流程...' }
+            if ("$($j.windows_activation)" -eq 'waiting_network') { $st.Status = '等待网络连接后激活 Windows + Office...' }
+            elseif ("$($j.windows_activation)" -eq 'running') { $st.Status = '正在联网激活 Windows + Office...' }
+            elseif ("$($j.windows_activation)" -eq 'max_retry') { break }
+        }
+        Start-Sleep -Seconds 5
     }
 
     # 3) 生成给用户看的结论
