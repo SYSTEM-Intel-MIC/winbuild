@@ -1277,11 +1277,15 @@ exit /b 0
 # SYSTEM-Intel-MIC 装机后在线清理（SYSTEM 身份）
 #
 # 唯一属主：计划任务 SYSTEM_Intel_MIC_Cleanup（ONLOGON / SYSTEM）。
-#   SetupComplete.cmd 注册这个任务以后立刻 schtasks /Run 一次，所以：
-#     * SetupComplete 跑在首登之前 → 任务在后台先做与登录无关的部分，等第一个用户
+#   注册入口有两个，任一个跑到了任务就在了（见 C:\FirstBoot\Register.cmd）：
+#     * autounattend.xml 的 specialize pass（Windows Setup 自己必然执行，只注册不 /Run）；
+#     * SetupComplete.cmd → Register.cmd /run（注册完立刻 schtasks /Run 一次）。
+#   于是：
+#     * 入口②跑在首登之前 → 任务在后台先做与登录无关的部分，等第一个用户
 #       真正登录后再删 Appx（并把启动器、计划任务的活一次干完）；
-#     * SetupComplete 已经跑在首登之后 → 立刻就做；
-#     * 万一 /Run 失败，ONLOGON 触发器在首次登录时还会再拉起一次（有实例锁互斥）。
+#     * 入口②已经跑在首登之后 → 立刻就做；
+#     * 万一两个入口的 /Run 都没成功，ONLOGON 触发器在首次登录时还会再拉起一次
+#       （有实例锁互斥，两个实例不会撞车）。
 #
 # 为什么必须等首次登录：「入门 Getstarted / Windows 备份 WindowsBackup /
 # Windows 安全中心 SecHealthUI / OneDrive」在离线 provisioned 列表里一条都 grep 不到，
@@ -1513,9 +1517,11 @@ if ($logonSeen) {
 }
 
 # --- 6. 补刀：激活器还没出结果就再拉它一次 -------------------------------
-#     SetupComplete 的 /Run 可能因为任务还没注册好、或者当时没网 30 分钟超时
-#     退出而漏掉。这里在**第一次登录之后**兜底再 /Run 一次；激活器自己是幂等的
-#     （有结果标记直接退出、没拿到授权就留着标记等下次登录），重复调用无副作用。
+#     这是激活器的第三道兜底（前两道：Register.cmd 的 /run、ONLOGON 触发器）。
+#     可能的漏法：注册时没网、30 分钟等联网超时就退出了、或者任务被抢先。
+#     这里在**第一次登录之后**兜底再 /Run 一次 —— 激活器自己是幂等的（有结果标记
+#     直接退出、没拿到授权就留着标记等下次登录），重复调用无副作用；它此刻若还在
+#     装 Office，任务计划程序默认 MultipleInstances=IgnoreNew 会忽略这次重复触发。
 if (Test-Path -LiteralPath "$base\ACTIVATION_RESULT.txt") {
     L 'activation result already present, no kick needed'
 } else {
@@ -1767,22 +1773,36 @@ $null = $runspace.AddScript({
     }
 
     # 1) 等 Office 装完（标记由 SYSTEM 的 Activate.cmd 写）
-    $deadline = (Get-Date).AddMinutes(90)
+    #    上限 45 分钟：Office 离线安装实测 3~8 分钟，超过 45 分钟基本就是计划任务
+    #    压根没跑 —— 再干等下去窗口会长时间挂着，用户看着就是「首启卡死」。
+    $deadline = (Get-Date).AddMinutes(45)
     while (-not (Test-Path -LiteralPath 'C:\FirstBoot\OFFICE_DONE') -and (Get-Date) -lt $deadline) {
         $st.Status = '正在安装 Office 365 (Word/Excel/PowerPoint)，请勿关机或断电...'
         Start-Sleep -Seconds 3
     }
-    if (Test-Path -LiteralPath 'C:\FirstBoot\OFFICE_DONE') {
+    $officeDone = Test-Path -LiteralPath 'C:\FirstBoot\OFFICE_DONE'
+    if ($officeDone) {
         $st.Status = 'Office 安装完成，正在联网激活 Windows + Office...'
     } else {
         $st.Status = '正在激活 Windows + Office（等待联网并运行 MAS，无需操作）...'
     }
 
-    # 2) 等激活结果（最多 60 分钟）
-    $deadline = (Get-Date).AddMinutes(60)
-    while (-not (Test-Path -LiteralPath $resultFile) -and (Get-Date) -lt $deadline) {
-        $st.Status = '正在激活 Windows + Office（等待联网并运行 MAS，无需操作）...'
-        Start-Sleep -Seconds 5
+    # 2) 等激活结果（最多 45 分钟）。
+    #    重试策略：本轮拿不到授权时 Activate.cmd **故意不写**结果标记，只写
+    #    C:\FirstBoot\ACT_TRY 计数、把任务留到下次登录再跑。所以只要看见 ACT_TRY，
+    #    就说明这一轮已经收尾了（继续等只会白等到超时），立刻出结论收窗。
+    #    这是 2026-10-07 配合「激活失败重试」新增的早退分支，否则进度窗会挂满 45 分钟。
+    if ($officeDone) {
+        $deadline = (Get-Date).AddMinutes(45)
+        while (-not (Test-Path -LiteralPath $resultFile) -and (Get-Date) -lt $deadline) {
+            $st.Status = '正在激活 Windows + Office（等待联网并运行 MAS，无需操作）...'
+            Start-Sleep -Seconds 5
+            if (Test-Path -LiteralPath 'C:\FirstBoot\ACT_TRY') {
+                $st.Status = '本轮激活尝试已结束，正在生成结果...'
+                Start-Sleep -Seconds 5   # 给 Activate.cmd 写结果收尾留点时间
+                break
+            }
+        }
     }
 
     # 3) 生成给用户看的结论
@@ -1813,9 +1833,12 @@ $null = $runspace.AddScript({
             $st.Status = "⚠ 激活部分完成（$netTxt）"
             $st.Info = ($parts -join "`r`n") + "`r`n可手动双击运行 C:\MAS\MAS_AIO.cmd 重试。"
         }
+    } elseif (Test-Path -LiteralPath 'C:\FirstBoot\ACT_TRY') {
+        $st.Status = '⚠ 本轮激活未成功，下次登录会自动重试'
+        $st.Info   = "Windows 还没拿到授权（最常见的原因：首启时还没连网）。`r`n计划任务 SYSTEM_Intel_MIC_Activate 会在「下次登录」自动再试一次（最多 5 次），不用你手动操作。`r`n想立刻试的话，联网后双击运行 C:\MAS\MAS_AIO.cmd 即可。"
     } else {
         $st.Status = '⚠ 未等到激活结果（联网较慢或激活器还没跑完）'
-        $st.Info   = "后台计划任务 SYSTEM_Intel_MIC_Activate 会在下次开机继续跑。`r`n也可手动双击运行 C:\MAS\MAS_AIO.cmd 重试。"
+        $st.Info   = "后台计划任务 SYSTEM_Intel_MIC_Activate 会在下次登录继续跑。`r`n也可手动双击运行 C:\MAS\MAS_AIO.cmd 重试。"
     }
     if ($tail) { $st.Info = "$($st.Info)`r`n`r`n激活日志尾部：`r`n$tail" }
     $st.Done = $true
