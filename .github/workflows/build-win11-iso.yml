@@ -33,7 +33,7 @@ on:
         default: enterprise
         required: true
       updates:
-        description: "集成最新累积更新（UUP dump 下载更新包）。默认关闭：LCU/Enablement/SSU/NetFx/SetupDU/SafeOSDU 都会让镜像涨 1~2 GB，默认不装"
+        description: "集成最新累积更新（UUP dump 下载更新包）。默认关闭：LCU/Enablement/SSU/NetFx/SetupDU/SafeOSDU 都会让镜像涨 1~2 GB，默认不装。注意：这只管「离线集成 LCU」；禁用并删除更新组件（wuauserv/UsoSvc/WaaSMedicSvc/DoSvc + AU 策略 + usoclient.exe 等）是恒定行为，与本开关无关"
         type: boolean
         default: false
       netfx3:
@@ -105,15 +105,15 @@ on:
 
       # ---- 深度精简 / Office / MAS ----
       deep_debloat:
-        description: "离线精简 install.wim：保留白名单式移除 Appx（含 Teams/Outlook/OneDrive/Xbox/纸牌/资讯/手机连接/获取帮助）+ 模糊匹配移除 AI/Copilot/Recall 等 Capability + 移除 IIS/MSMQ/WCF 等可选功能 + 注册表优化 + 禁用无用服务 + 删更新类计划任务"
+        description: "离线精简 install.wim：保留白名单式移除 Appx（含 Teams/Outlook/OneDrive/Xbox/纸牌/资讯/手机连接/获取帮助）+ 模糊匹配移除 AI/Copilot/Recall 等 Capability + 移除 IIS/MSMQ/WCF 等可选功能 + 注册表优化 + 禁用无用服务 + 删更新类计划任务 + 删更新组件本体（usoclient.exe/wuaueng.dll/wuaucpl.cpl）"
         type: boolean
         default: true
       office_offline:
-        description: "离线集成 Office 365（Word/Excel/PowerPoint），ODT + 离线包在 Action 里下载，首登录自动安装"
+        description: "离线集成 Office 365（Word/Excel/PowerPoint），ODT + 离线包在 Action 里下载，首次登录由 SYSTEM 同步安装（每次上限 20 分钟、最多 3 次，失败下次登录自动续装）"
         type: boolean
         default: true
       mas_activate:
-        description: "首登录自动激活：SYSTEM 后台等 Office 装完 + 等联网后，无人值守跑 MAS /HWID /Ohook /S（离线时只跑 /Ohook）"
+        description: "自动激活：SYSTEM 后台等 Office 装完 + 等联网后无人值守跑 MAS /HWID /Ohook /S（离线时只跑 /Ohook）。三道兜底（autounattend specialize pass / SetupComplete → Register.cmd / Cleanup.ps1 补拉），ONLOGON 触发、最多重试 5 次、拿到授权才自删任务"
         type: boolean
         default: true
       perf_tweaks:
