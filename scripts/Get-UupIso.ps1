@@ -1701,7 +1701,8 @@ goto waitnet
 
 :office_missing
 set OFFICE=SKIP
-set STATUS_OFFICE=failed
+set STATUS_OFFICE=skipped
+set STATUS_OFFICE_ACT=skipped
 echo [%date% %time%] Office source/setup missing >> "%LOG%"
 call :write_status
 goto waitnet
@@ -1709,6 +1710,7 @@ goto waitnet
 :officefail
 set OFFICE=SKIP
 set STATUS_OFFICE=failed
+set STATUS_OFFICE_ACT=failed
 echo [%date% %time%] Office install failed after retries >> "%LOG%"
 call :write_status
 goto waitnet
@@ -1761,6 +1763,9 @@ if not errorlevel 1 set WIN_LICENSE=1
 findstr /r /x /c:"0" "%TEMP%\wl.txt" >nul 2>&1
 if not errorlevel 1 set WIN_LICENSE=0
 set STATUS_LICENSE=!WIN_LICENSE!
+if "%OFFICE%"=="OK" if "!OHOOKCODE!"=="0" set STATUS_OFFICE_ACT=success
+if "%OFFICE%"=="OK" if not "!OHOOKCODE!"=="0" set STATUS_OFFICE_ACT=failed
+if not "%OFFICE%"=="OK" set STATUS_OFFICE_ACT=skipped
 if not "%OFFICE%"=="OK" goto reswrite
 if not exist "C:\OfficeInstall\setup.exe" goto reswrite
 ping -n 61 127.0.0.1 >nul
@@ -1773,12 +1778,10 @@ if "%WIN_LICENSE%"=="1" goto finalize
 > "C:\FirstBoot\ACT_TRY" echo(!TRIES!
 if !TRIES! lss 5 goto trylater
 set STATUS_WIN_ACT=max_retry
-set STATUS_OFFICE_ACT=failed
 goto finalize
 
 :trylater
 set STATUS_WIN_ACT=failed
-set STATUS_OFFICE_ACT=failed
 call :write_status
 echo [%date% %time%] not licensed yet, attempt !TRIES! of 5, retry on next logon >> "%LOG%"
 endlocal
