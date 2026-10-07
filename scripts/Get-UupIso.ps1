@@ -397,7 +397,7 @@ function New-UnattendXml {
     # 为什么必须加这一段 —— 实测两次「Office 压根没装 + Win/Office 都没激活 + 四个点名
     # Appx 也没删」的根因：
     #   SetupComplete.cmd 只在「官方安装程序 + autounattend 生效」这条路径上才会执行。
-    #   一旦它没跑（用 DISM++/NTLite 部署、脚本被安全软件拦掉、装完后被清理……），
+    #   一旦它没跑（用 DISM++/NTLite 部署、脚本被安全软件拦掉、装完后被清理...），
     #   后面所有东西 —— 计划任务 SYSTEM_Intel_MIC_Activate / _Cleanup、RunOnce 进度窗 ——
     #   一个都不会注册，表现就是「装完什么都没发生」。
     # specialize 是 Windows Setup **自己必然执行**的一段，RunSynchronous 在这里跑在
@@ -1782,9 +1782,9 @@ $null = $runspace.AddScript({
     }
     $officeDone = Test-Path -LiteralPath 'C:\FirstBoot\OFFICE_DONE'
     if ($officeDone) {
-        $st.Status = 'Office 安装完成，正在联网激活 Windows + Office...'
+        $st.Status = 'Office 安装完成，正在联网激活 Windows + Office...（如还没上网，请先连 Wi-Fi）'
     } else {
-        $st.Status = '正在激活 Windows + Office（等待联网并运行 MAS，无需操作）...'
+        $st.Status = '正在激活 Windows + Office（等待联网并运行 MAS）...（如还没上网，请先连 Wi-Fi）'
     }
 
     # 2) 等激活结果（最多 45 分钟）。
@@ -1795,7 +1795,7 @@ $null = $runspace.AddScript({
     if ($officeDone) {
         $deadline = (Get-Date).AddMinutes(45)
         while (-not (Test-Path -LiteralPath $resultFile) -and (Get-Date) -lt $deadline) {
-            $st.Status = '正在激活 Windows + Office（等待联网并运行 MAS，无需操作）...'
+            $st.Status = '正在联网激活 Windows + Office...（如还没上网，请先连 Wi-Fi，联网后会自动完成）'
             Start-Sleep -Seconds 5
             if (Test-Path -LiteralPath 'C:\FirstBoot\ACT_TRY') {
                 $st.Status = '本轮激活尝试已结束，正在生成结果...'
