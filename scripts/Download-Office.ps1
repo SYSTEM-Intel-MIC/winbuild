@@ -66,7 +66,7 @@ $ConfigurationTemplate = @'
   <Property Name="SharedComputerLicensing" Value="0" />
   <Property Name="FORCEAPPSHUTDOWN" Value="TRUE" />
   <Property Name="AUTOACTIVATE" Value="0" />
-  <Updates Enabled="TRUE" />
+  <Updates Enabled="FALSE" />
   <Display Level="None" AcceptEULA="TRUE" />
 </Configuration>
 '@
