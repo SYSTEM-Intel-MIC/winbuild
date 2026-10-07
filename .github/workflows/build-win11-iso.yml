@@ -33,7 +33,7 @@ on:
         default: enterprise
         required: true
       updates:
-        description: "集成最新累积更新（UUP dump 下载更新包）。默认关闭：LCU/Enablement/SSU/NetFx/SetupDU/SafeOSDU 都会让镜像涨 1~2 GB，默认不装。注意：这只管「离线集成 LCU」；禁用并删除更新组件（wuauserv/UsoSvc/WaaSMedicSvc/DoSvc + AU 策略 + usoclient.exe 等）是恒定行为，与本开关无关"
+        description: "集成最新累积更新（UUP dump 下载更新包）。默认关闭：LCU/Enablement/SSU/NetFx/SetupDU/SafeOSDU 都会让镜像涨 1~2 GB，默认不装。注意：这只管「离线集成 LCU」；禁用并删除更新组件（wuauserv/UsoSvc/WaaSMedicSvc/DoSvc + AU 策略 + usoclient.exe 等）由精简开关决定（deep_debloat/perf_tweaks/office_offline/mas_activate 任一开启即包含，默认全开），与本开关无关"
         type: boolean
         default: false
       netfx3:
