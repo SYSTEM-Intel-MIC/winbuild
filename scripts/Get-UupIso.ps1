@@ -1574,7 +1574,35 @@ L '=== online cleanup finished: CLEANUP_DONE written, task self-deleted ==='
         # 所以「用户中途重启」不再会把激活打断：下次登录自己重跑，
         # Office 没装完就同步重跑 setup.exe 续装，没拿到授权就留着结果标记不写、
         # 下次登录再试（最多 5 次），成功后才自我删除任务。
-        $activateContent = @'
+        $statusWriterContent = @'
+param(
+    [int]$Attempt,
+    [string]$Office,
+    [string]$OfficeActivation,
+    [string]$WindowsActivation,
+    [string]$Network,
+    [string]$HwidExit,
+    [string]$OhookExit,
+    [string]$WinLicense
+)
+$o = [ordered]@{
+    schema = 1
+    updated = (Get-Date).ToString('o')
+    attempt = $Attempt
+    office = $Office
+    office_activation = $OfficeActivation
+    windows_activation = $WindowsActivation
+    network = $Network
+    hwid_exit = $HwidExit
+    ohook_exit = $OhookExit
+    win_license = $WinLicense
+}
+$tmp = 'C:\FirstBoot\status.json.tmp'
+$o | ConvertTo-Json -Compress | Set-Content -LiteralPath $tmp -Encoding UTF8
+Move-Item -LiteralPath $tmp -Destination 'C:\FirstBoot\status.json' -Force
+'@
+
+$activateContent = @'
 REM ===== SYSTEM-Intel-MIC Activate (SYSTEM, task SYSTEM_Intel_MIC_Activate) =====
 REM State source of truth: C:\FirstBoot\status.json (atomic tmp -> Move-Item).
 REM Office install is intentionally synchronous during SetupComplete; no Kill() is used.
@@ -1597,7 +1625,7 @@ if exist "%RES%" goto selfdelete
 echo [%date% %time%] activator start attempt !TRIES! >> "%LOG%"
 
 :write_status
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$o=[ordered]@{schema=1;updated=(Get-Date).ToString('o');attempt=[int]$env:STATUS_ATTEMPT;office=$env:STATUS_OFFICE;office_activation=$env:STATUS_OFFICE_ACT;windows_activation=$env:STATUS_WIN_ACT;network=$env:STATUS_NET;hwid_exit=$env:STATUS_HWID;ohook_exit=$env:STATUS_OHOOK;win_license=$env:STATUS_LICENSE};$tmp='C:\FirstBoot\status.json.tmp';$o|ConvertTo-Json -Compress|Set-Content -LiteralPath $tmp -Encoding UTF8;Move-Item -LiteralPath $tmp -Destination 'C:\FirstBoot\status.json' -Force" >> "%LOG%" 2>&1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\FirstBoot\Write-Status.ps1" -Attempt !STATUS_ATTEMPT! -Office "!STATUS_OFFICE!" -OfficeActivation "!STATUS_OFFICE_ACT!" -WindowsActivation "!STATUS_WIN_ACT!" -Network "!STATUS_NET!" -HwidExit "!STATUS_HWID!" -OhookExit "!STATUS_OHOOK!" -WinLicense "!STATUS_LICENSE!" >> "%LOG%" 2>&1
 exit /b 0
 
 :status_start
@@ -1651,8 +1679,15 @@ if not errorlevel 1 goto officeok
 set POLL=0
 :office_c2r_settle
 ping -n 11 127.0.0.1 >nul
+tasklist /FI "IMAGENAME eq setup.exe" 2>nul | find /I "setup.exe" >nul
+if not errorlevel 1 goto office_c2r_wait
+tasklist /FI "IMAGENAME eq OfficeClickToRun.exe" 2>nul | find /I "OfficeClickToRun.exe" >nul
+if errorlevel 1 goto office_c2r_wait
 if exist "C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE" goto officeok
 if exist "C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE" goto officeok
+goto office_c2r_wait
+
+:office_c2r_wait
 set /a POLL+=1
 if !POLL! lss 12 goto office_c2r_settle
 goto officepoll_failed
@@ -1772,6 +1807,10 @@ del "C:\FirstBoot\ACT_TRY" >nul 2>&1
 endlocal
 exit /b 0
 '@
+        # Write-Status.ps1：唯一负责 status.json 原子写入
+        $statusWriterPath = Join-Path $firstBootDir 'Write-Status.ps1'
+        [System.IO.File]::WriteAllText($statusWriterPath, $statusWriterContent, (New-Object System.Text.UTF8Encoding($false)))
+
         # Ascii 写出：Activate.cmd 里全是英文注释，杜绝编码歧义
         Set-Content -LiteralPath $activateCmd -Value (Convert-ToCrlf $activateContent) -Encoding Ascii
 
@@ -1816,12 +1855,15 @@ $null = $runspace.AddScript({
     }
 
     # 1) status.json is the single source of truth.
-    $deadline = (Get-Date).AddMinutes(60)
+    # One total observer timeout avoids serial 60m + 45m waits.
+    $deadline = (Get-Date).AddMinutes(120)
     while ((Get-Date) -lt $deadline) {
         $j = $null
-        try { if (Test-Path -LiteralPath 'C:\FirstBoot\status.json') {
-            $j = Get-Content -LiteralPath 'C:\FirstBoot\status.json' -Raw -ErrorAction Stop | ConvertFrom-Json
-        }} catch { $j = $null }
+        try {
+            if (Test-Path -LiteralPath 'C:\FirstBoot\status.json') {
+                $j = Get-Content -LiteralPath 'C:\FirstBoot\status.json' -Raw -ErrorAction Stop | ConvertFrom-Json
+            }
+        } catch { $j = $null }
         if ($j) {
             switch ("$($j.office)") {
                 'installing' { $st.Status = '正在安装 Office 365 (Word/Excel/PowerPoint)，请勿关机或断电...' }
@@ -1829,25 +1871,12 @@ $null = $runspace.AddScript({
                 'failed'     { $st.Status = '⚠ Office 安装失败；正在继续处理 Windows + Office 激活...' }
                 default      { $st.Status = '正在等待 SYSTEM 后台任务启动...' }
             }
-        }
-        Start-Sleep -Seconds 3
-    }
-
-    # 2) 等最终结果；不再用 ACT_TRY 推断后台状态。
-    $deadline = (Get-Date).AddMinutes(45)
-    while (-not (Test-Path -LiteralPath $resultFile) -and (Get-Date) -lt $deadline) {
-        $j = $null
-        try { if (Test-Path -LiteralPath 'C:\FirstBoot\status.json') {
-            $j = Get-Content -LiteralPath 'C:\FirstBoot\status.json' -Raw -ErrorAction Stop | ConvertFrom-Json
-        }} catch { $j = $null }
-        if ($j) {
-            if ("$($j.office)" -eq 'installing') { $st.Status = '正在安装 Office 365...' }
-            elseif ("$($j.office)" -eq 'installed') { $st.Status = 'Office 已安装，正在联网激活 Windows + Office...' }
-            elseif ("$($j.office)" -eq 'failed') { $st.Status = '⚠ Office 安装失败，正在继续完成激活流程...' }
             if ("$($j.windows_activation)" -eq 'waiting_network') { $st.Status = '等待网络连接后激活 Windows + Office...' }
             elseif ("$($j.windows_activation)" -eq 'running') { $st.Status = '正在联网激活 Windows + Office...' }
             elseif ("$($j.windows_activation)" -eq 'max_retry') { break }
+            if ("$($j.office_activation)" -eq 'success' -and "$($j.windows_activation)" -eq 'success') { break }
         }
+        if (Test-Path -LiteralPath $resultFile) { break }
         Start-Sleep -Seconds 5
     }
 
