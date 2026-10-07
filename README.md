@@ -42,8 +42,8 @@ winbuild/
 4. **并行**启动 `Download-Office.ps1`（后台 `Start-Job`），然后运行 `uup_download_windows.cmd`：
    aria2 从 Windows Update 服务器拉 UUP 文件，uup-converter-wimlib 挂载镜像 → 打补丁 → 导出 → 生成 ISO
 5. （`deep_debloat` / `office_offline` / `mas_activate` / `perf_tweaks` 任一开着时）**离线定制 `install.wim`**：
-   挂载 → 移除 Appx/Capability/可选功能 → 离线组件清理 → 写服务与注册表 → 放入 Office 离线包、MAS、
-   `SetupComplete.cmd` + `C:\FirstBoot\{Activate.cmd, Cleanup.ps1, FirstBoot.ps1}` → 提交卸载
+   挂载 → 移除 Appx/Capability/可选功能 → 离线组件清理 → 写服务与注册表 → 删更新组件本体 → 放入 Office 离线包、MAS、
+   `C:\FirstBoot\{Register.cmd, Activate.cmd, Cleanup.ps1, FirstBoot.ps1}` + `SetupComplete.cmd` → 提交卸载
 6. （`unattend` 开着时）生成 `autounattend.xml` 并**重新封盘**：
    读回原 ISO 卷标 → 挂载后 `robocopy` 展开 → 应答文件放到 ISO 根目录 →
    （仓库有 `OEM/logo.bmp` 时）`wimlib-imagex update` 把它塞进 `install.wim` 的 `\Windows\System32\` →
@@ -146,13 +146,27 @@ Actions → **Build Windows 11 ISO** → *Run workflow*：
 
 `unattend` 开着时，脚本会在转换完成后**把 ISO 重新封一遍盘**，把生成的 `autounattend.xml`
 放到 ISO 根目录（Windows Setup 会自动搜索安装介质根目录的 `autounattend.xml`）。
-生成的文件分两个 pass，并会额外写入 `SetupComplete.cmd` 与 `FirstBoot.ps1`：
+生成的文件分**三个** pass，并会额外写入 `Register.cmd`、`SetupComplete.cmd` 与
+`C:\FirstBoot\{Cleanup.ps1, Activate.cmd, FirstBoot.ps1}`：
 
 | pass | 内容 | 开关 |
 | --- | --- | --- |
 | `windowsPE` | `Microsoft-Windows-Setup\RunSynchronous` 往 `HKLM\SYSTEM\Setup\LabConfig` 写 `BypassTPMCheck` / `BypassSecureBootCheck` / `BypassRAMCheck`；外加 `International-Core-WinPE` 固定 zh-CN 输入法 | `hw_bypass` |
-| `windowsPE` | **无条件**执行 3 条 `RunSynchronous`：往 PE 注册表写 `AU\NoAutoUpdate=1` / `AUOptions=2` / `AutoInstallMinorUpdates=0`（拦住**安装会话内**的检查更新） | 无开关（恒定执行） |
+| `windowsPE` | **无条件**执行 3 条 `RunSynchronous`：往 PE 注册表写 `AU\NoAutoUpdate=1` / `AUOptions=1` / `AutoInstallMinorUpdates=0`（拦住**安装会话内**的检查更新；WinPE 注册表是内存盘，重启就丢，只影响装机那一段） | 无开关（恒定执行） |
+| **`specialize`** | `Microsoft-Windows-Deployment\RunSynchronous` 执行 `cmd /c "C:\FirstBoot\Register.cmd & exit 0"` —— **幂等地把两个计划任务 + `RunOnce` 进度窗先注册好**（见下面「首登录编排器」） | 无开关（恒定执行） |
 | `oobeSystem` | `OOBE`：`HideEULAPage` / `HideOEMRegistrationScreen` / `HideOnlineAccountScreens` / `HideWirelessSetupInOOBE` / `ProtectYourPC=3`；`OEMInformation`、`RegisteredOrganization`、`TimeZone=China Standard Time` | `skip_oobe` / `oem_*` |
+
+> **⚠ 为什么多出一个 `specialize` pass（2026-10-07 实机翻车后的修复）**：
+> 原来「装 Office / 激活 / 在线清理」三件事的**唯一**注册入口是 `SetupComplete.cmd`。
+> 实测最新构建出现「Office 压根没装 + Win 和 Office 都没激活 + 四个点名 Appx 也没删」——
+> 三件事同时不发生，只可能是**它们共同的前置条件没成立**，也就是那条链子没跑。
+> `specialize` 是 Windows Setup **自己必然执行**的一段（不是可选钩子），而且这里的
+> `RunSynchronous` 跑在**完整 Windows** 里（有 `schtasks.exe` / `reg.exe` / `cmd.exe`，
+> 不是 WinPE），身份是 SYSTEM —— 所以把注册动作搬进来先做一遍，`SetupComplete.cmd`
+> 之后再调同一个 `C:\FirstBoot\Register.cmd` 也无所谓（`/F` 覆盖，幂等）。
+> 两个入口互为兜底，任何一个被跳过都不影响结果。
+> 命令本身套 `& exit 0`：`Register.cmd` 万一不存在（关掉了精简/Office/MAS 开关），
+> 也绝不能返回非 0 去影响安装。
 
 > **每条 `RunSynchronous` 都被包成了 `cmd /c "…" & exit 0`，原因见下面「行为边界」第 3 条。**
 >
@@ -233,10 +247,11 @@ dism /Remove-ProvisionedAppxPackage /PackageName:$app      # 其余全部移除
 | 点名卸载的系统应用 | `WindowsBackup` `Backup` `SecHealthUI` | Windows 备份 / Windows 安全中心（离线删不掉，见下） |
 
 > **⚠ `Getstarted`（入门）/ `WindowsBackup`（Windows 备份）/ `SecHealthUI`（安全中心）
-> 在离线的 provisioned 列表里根本不存在**（构建日志 grep 计数 = 0），上面这行强删
-> 属于「碰到了就删」的兜底，**真正把它们卸掉的是装机后的 `Cleanup.ps1`** ——
-> 装完系统系统跑起来之后，以 SYSTEM 身份在线 `Get-AppxPackage -AllUsers` + 
-> `Get-AppxProvisionedPackage -Online` 删。详见「装机后在线清理」一节。
+> 在离线的 provisioned 列表里根本不存在**（构建日志 grep 计数 = 0）—— 它们是**随首登才
+> 注册的 staged 包**，没登录之前系统里根本没有。上面这行强删属于「碰到了就删」的兜底，
+> **真正把它们卸掉的是装机后的 `Cleanup.ps1`**：以 SYSTEM 身份**等第一次交互式登录之后**，
+> 用 `Get-AppxProvisionedPackage -Online` + `Get-AppxPackage -AllUsers` 删。
+> 详见「装机后在线清理」一节（含 `CLEANUP_DONE` 标记与 `ONLOGON` 任务的设计原因）。
 
 **①b OneDrive 是系统级的，不走 Appx（离线做一遍，装机后再在线兜底一遍）：**
 
@@ -377,19 +392,22 @@ Hyper-V 与 WSL。清单里的关键词**匹配不到就跳过**，不会报错�
 | 远程桌面 USB 重定向 | `UmRdpService` | 只禁 USB 重定向，**`TermService` 保留，远程桌面照样能用** |
 | Windows Insider / 扫描仪 | `wisvc` `stisvc` | Insider 注册服务（已经是预览版，不必再上报通道）；WIA 扫描仪服务（没有扫描仪）。**`Spooler` 保留，打印不受影响** |
 | **Windows 安全中心 / Defender** | `WinDefend` `WdNisSvc` `SecurityHealthService` `Sense` | 用户点名「禁用 Windows 安全中心（最好直接卸载）」。`WinDefend`＝Defender 主服务（实时防护），`WdNisSvc`＝网络检测，`SecurityHealthService`＝「Windows 安全中心」UI 的后端（托盘图标靠它），`Sense`＝Defender for Endpoint 云端连接。四个全禁 + 下面的策略键 → 安全中心打不开、托盘不再弹提醒；**真正的「卸载」（删 `SecHealthUI` 应用包）在装完机后由 `Cleanup.ps1` 在线做**，离线 `/Remove-ProvisionedAppxPackage` 会报 `0x80073CFA`（退出码 15610） |
+| **Windows 更新全家** | `wuauserv` `UsoSvc` `WaaSMedicSvc` `DoSvc` | 用户 2026-10-07 点名「**删除并完全禁止更新组件**」。`wuauserv`＝更新主服务（「检查更新」全靠它），`UsoSvc`＝Update Orchestrator（**OOBE 的「正在检查更新」走的就是它**），`WaaSMedicSvc`＝Windows Update Medic（**会偷偷把前两个改回自动**，不一起禁等于白禁），`DoSvc`＝Delivery Optimization（更新 P2P 分发）。**`BITS` 刻意不禁**：商店 / winget 的应用分发也走它。详见 ⑧ 的「Windows 更新」一节 |
 
 **刻意保留（改了会把系统搞坏或砍掉基础功能）：**
 
 `Spooler`(打印) ·
-`wuauserv`(Windows 更新) · `TrustedInstaller` `AppXSvc` `StateRepository` `AppReadiness`(装应用) ·
+`BITS`(商店/winget 应用分发，更新已另行禁用) · `TrustedInstaller` `AppXSvc` `StateRepository` `AppReadiness`(装应用) ·
 `Themes`(主题) · `MpsSvc`(防火墙) · `LanmanServer` `LanmanWorkstation`(局域网共享) ·
 `TermService`(远程桌面，`UmRdpService` 只禁 USB 重定向不影响连机) · `Netlogon` `KeyIso` `EventSystem`(账户/事件) ·
 `msiserver`(MSI 安装) · `RasMan` `RasAuto`(VPN) · `WSearch` `SearchIndexer`(搜索) ·
 `CDPUserSvc` `CDPSvc`(投屏/剪贴板同步) · `TabletInputService`(触摸键盘) · `SharedAccess`(移动热点) ·
 `LSM` `RpcSs` `DcomLaunch`(系统核心) · `BrokerInfrastructure` `SystemEventsBroker`(后台任务)
 
-> **注意**：`WinDefend` / `SecurityHealthService` / `WdNisSvc` 以前在「刻意保留」名单里，
-> 现在已按用户要求移到禁用名单（见上表最后一行）。
+> **注意**：`WinDefend` / `SecurityHealthService` / `WdNisSvc` / **`wuauserv`** / **`UsoSvc`** /
+> **`WaaSMedicSvc`** / **`DoSvc`** 都曾经过「刻意保留」名单，现在已按用户要求移入禁用名单
+> （见上表最后两行）。`wuauserv` 是 2026-10-07 从保留名单里移出去的 —— 旧版保留它是为了
+> 「手动更新能力保留」，用户明确改口要「完全禁止更新组件」。
 
 > **历史包袱说明**：脚本里那个 700+ 项的巨型 `$servicesToDisable`（含 `LSASS` `EventLog`
 > `PlugPlay` `SearchIndexer` 等**绝不能禁**的名字）是**死代码**——被后面这份正式清单整个覆盖掉了，
@@ -494,22 +512,47 @@ Hyper-V 与 WSL。清单里的关键词**匹配不到就跳过**，不会报错�
 | `Policies\Microsoft\Windows\DNSClient` | `DisableMulticast=1` | 关 DNS 多播（SSDP/网络发现噪音） |
 | `Policies\Microsoft\Windows\DeliveryOptimization` | `DownloadMode=0` | 更新下载**只走 HTTP**，不做 P2P 上传 |
 
-#### Windows 更新（**硬需求：不允许自动更新，OOBE 也不更新；手动检查更新保留**）
+#### Windows 更新（**硬需求 2026-10-07 升级：删除并完全禁止更新组件，OOBE 也不许检查更新**）
+
+> **行为变更**：旧版策略是「禁止**自动**更新、保留手动检查」（`AUOptions=2`），
+> 实测**管不住 OOBE 的「正在检查更新」** —— OOBE 走的是 Update Orchestrator 那条路，
+> 根本不读 AU 策略。现在改成三层一起下手，**更新能力整体关闭**：
+
+| 层 | 做法 | 位置 |
+|---|---|---|
+| ① 服务 | `Start=4` 禁用 `wuauserv` `UsoSvc` `WaaSMedicSvc` `DoSvc` | 离线 SYSTEM hive（⑦），`Cleanup.ps1` 在线再钉一次 |
+| ② 策略 | 下表全部键 | 离线 SOFTWARE hive（⑧） |
+| ③ 组件本体 | 删除 `usoclient.exe` `wuaueng.dll` `wuaucpl.cpl` + `Windows\SoftwareDistribution` 缓存 | 离线 ⑧c，`Cleanup.ps1` 在线再删一遍更新计划任务 |
 
 | 键 | 值 | 原因 |
 |---|---|---|
-| `Policies\Microsoft\Windows\WindowsUpdate\AU` | `NoAutoUpdate=1` | **关掉自动检查/下载/安装**；设置里手动「检查更新」仍然可用 |
-| `Policies\Microsoft\Windows\WindowsUpdate\AU` | `AUOptions=2` | 兜底：就算策略被绕过，也只「通知下载并通知安装」 |
+| `Policies\Microsoft\Windows\WindowsUpdate\AU` | `NoAutoUpdate=1` | **关掉自动检查/下载/安装** |
+| `Policies\Microsoft\Windows\WindowsUpdate\AU` | `AUOptions=1` | **「从不检查更新」**（旧值 `2` = 通知下载仍会检查，这是 OOBE/设置能检查到更新的口子） |
 | `Policies\Microsoft\Windows\WindowsUpdate\AU` | `AutoInstallMinorUpdates=0` | 连小更新都不许悄悄装 |
-| `Policies\Microsoft\Windows\WindowsUpdate` | `DeferFeatureUpdatesPeriodInDays=400` | 功能更新推迟 400 天（约等于永不来） |
-| `Policies\Microsoft\Windows\WindowsUpdate` | `DeferQualityUpdatesPeriodInDays=400` | 质量更新同上 |
+| `Policies\Microsoft\Windows\WindowsUpdate` | `DisableWindowsUpdateAccess=1` | 设置里的 Windows 更新入口被禁用（显示「由组织管理」） |
+| `Policies\Microsoft\Windows\WindowsUpdate` | `DoNotConnectToWindowsUpdateInternetLocations=1` | **连更新服务器都不去连** —— 这是掐掉 OOBE 检查更新最直接的一条 |
+| `Policies\Microsoft\Windows\WindowsUpdate` | `SetDisableUXWUAccess=1` | 隐藏 / 禁用更新的 UX 入口 |
+| `Policies\Microsoft\Windows\WindowsUpdate` | `DeferFeatureUpdatesPeriodInDays=400` `DeferQualityUpdatesPeriodInDays=400` | 双保险：就算上面被绕过，功能/质量更新也推迟 400 天 |
 | `Policies\Microsoft\Windows\WindowsUpdate` | `NoAutoRebootWithLoggedOnUsers=1` | 就算有更新也不许自动重启 |
 | `Policies\Microsoft\Windows\WindowsUpdate` | `ExcludeWUDriversInQualityUpdate=1` | Windows Update 不自动装驱动（要驱动用 `drivers` 开关离线注入） |
+| `Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update` | `NoAutoUpdate=1` | 老式 AU 键，部分组件还在读 |
 | `Policies\Microsoft\WindowsStore` | `DisableAutoUpdate=1` | **商店也不许自己更新**，否则被删的预装 Appx 可能被推回来 |
 
-> 三条防线合起来：**① 离线注册表（上表）**、**② 应答文件 `windowsPE` 关掉 PE 的 `wuauserv`
-> + 写 AU 策略**（拦安装期的 Setup DU 和 OOBE 检查）、**③ 删掉会自己跑更新的计划任务**（见 ⑧b）。
-> `wuauserv` 与 `WaaSMedicSvc` **刻意不禁用** —— 禁了手动更新就废了，你要的是「不自动」不是「不能」。
+> **服务为什么必须一起禁**：`WaaSMedicSvc`（Windows Update Medic）的职责就是
+> **「发现更新服务被关掉就改回来」**，还带服务恢复机制会自动拉起 —— 只写策略、
+> 不禁它，`wuauserv` 分分钟被恢复。`UsoSvc`（Update Orchestrator）是 OOBE
+> 「正在检查更新」的执行者。**`BITS` 刻意不禁**：商店 / winget 的应用分发也走它，
+> 禁了会把商店搞坏。
+>
+> **③ 删了哪些文件**：`usoclient.exe`（Update Session Orchestrator 客户端，OOBE 与
+> 更新任务的入口）、`wuaueng.dll`（更新引擎本体）、`wuaucpl.cpl`（旧版「Windows 更新」
+> 控制面板项）。每删一个都先 `takeown` + `icacls`（离线镜像里 `System32` 归
+> TrustedInstaller 所有，不改属主删不动），且带存在性判断。**刻意不删** `wuapi.dll`
+> 与 Settings 的更新提供程序 —— 那是通用 API 表面，删了会连带把设置应用/商店搞崩。
+>
+> **⚠ `updates` 输入开关只决定「是否离线集成最新累积更新（LCU）」**，
+> 与上面的「删除并禁止更新组件」**无关**（后者是恒定行为）。就算 `updates=true`
+> 把 LCU 打进镜像，系统跑起来后也不会再自己检查/下载任何更新。
 
 #### 广告 / 推广 / 预留空间 / 活动历史
 
@@ -574,12 +617,25 @@ load 失败只 `Write-Warning` 跳过，不影响构建。
 
 策略只管 Windows Update 主程序，**计划任务是另一条触发路径**。直接删
 `Windows\System32\Tasks\Microsoft\Windows\` 下的任务文件即可（离线状态最省事），
-只删更新与遥测类，**不碰**磁盘整理、系统诊断、Defender 扫描这些正经任务：
+只删更新与遥测类，**不碰**磁盘整理、系统诊断、Defender 扫描这些正经任务。
+2026-10-07 起分两种删法：
+
+**(a) 按目录整棵删** —— 这三棵目录下的任务**全部**是更新相关，通配删比逐个列名更保险：
+
+| 目录 | 作用 |
+|---|---|
+| `WindowsUpdate\` | `Scheduled Start`（⭐ 例行更新）、`Orchestrator\*` |
+| `UpdateOrchestrator\` | `Schedule Scan` `Schedule Work` `USO_UxBroker` `Maintain Enable` `Refresh Settings` `Policy Install` `Backup Boot Scan` —— Windows 11 的**真实路径**（老写法 `WindowsUpdate\Orchestrator\` 在 Win11 上根本不存在） |
+| `WaaSMedic\` | `PerformRepairs` `Reboot` —— **更新修复服务，会把被禁的服务改回来** |
+
+**(b) 按文件名删（老布局 + 遥测类）**：
 
 | 任务文件 | 作用 |
 |---|---|
 | `WindowsUpdate\Scheduled Start` | ⭐ **例行 Windows 更新**，会自动下载安装 |
-| `WindowsUpdate\Orchestrator\USO_UxBroker` `WindowsUpdate\Orchestrator\UpdateOrchestrator` | 更新编排器 |
+| `WindowsUpdate\Orchestrator\USO_UxBroker` `WindowsUpdate\Orchestrator\UpdateOrchestrator` | 更新编排器（老布局） |
+| `UpdateOrchestrator\Schedule Scan` `Schedule Work` `USO_UxBroker` | Windows 11 更新编排器 |
+| `WaaSMedic\PerformRepairs` `WaaSMedic\Reboot` | 更新修复 |
 | `Automatic App Update` | 商店应用自动更新 |
 | `Maps\MapsToastTask` `Maps\MapsUpdateTask` | 离线地图更新 |
 | `Customer Experience Improvement Program\Consolidator` `Customer Experience Improvement Program\UsbCeip` | 客户体验改进（采样） |
@@ -587,6 +643,31 @@ load 失败只 `Write-Warning` 跳过，不影响构建。
 | `DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector` | 磁盘诊断数据收集 |
 
 文件不存在就跳过；删除失败只 `Write-Warning`。
+
+#### ⑧c 删除 Windows 更新组件本体（用户 2026-10-07 要求「删除并完全禁止更新组件」）
+
+三层里的最后一层：服务禁用 + 策略是主防线，这里把**更新引擎二进制**直接删掉，
+保证哪天服务被 `WaaSMedicSvc` 或人为改回自动也**起不来**（`wuauserv` 要加载的
+`wuaueng.dll` 已经不在了，服务只会启动失败）。
+
+| 文件 | 作用 |
+|---|---|
+| `Windows\System32\usoclient.exe` | Update Session Orchestrator 客户端 —— **OOBE「正在检查更新」和更新任务的调用入口** |
+| `Windows\System32\wuaueng.dll` | Windows Update 引擎本体 |
+| `Windows\System32\wuaucpl.cpl` | 旧版「Windows 更新」控制面板项 |
+
+- 每个文件先 `takeown.exe /F` + `icacls.exe ... /grant '*S-1-5-32-545:F'`：离线镜像里
+  `System32` 归 TrustedInstaller 所有，**不改属主根本删不动**；
+- 每个都带 `Test-Path` 存在性判断，缺一个不影响别的；
+- 顺手删 `Windows\SoftwareDistribution` 更新下载缓存（离线镜像里通常还没生成，存在就删）；
+- **刻意不删** `wuapi.dll` 与 `WindowsUpdateCPL.dll` / Settings 的更新提供程序：
+  那是通用 API 表面，删了会连带把设置应用、商店的更新逻辑搞崩 —— 主防线已经足够。
+
+> **⚠ 这一步和 ⑧b 一样，在离线镜像里多数是空转**：`Windows\System32\Tasks` 要等系统
+> 首次启动才生成，所以「已删除计划任务」在构建日志里经常一条都没有，属预期。
+> 更新组件文件通常**是**存在的（它们随 WIM 一起展开），日志里应该能看到
+> `==> 已删除更新组件: Windows\System32\usoclient.exe` 等三行。
+> 真正生效的是装机后的 `Cleanup.ps1` —— 它在线再禁一遍服务、再删一遍计划任务。
 
 > **⚠ 这一步在 `updates=false` 时实际是空转的**：离线挂载的镜像里
 > `Windows\System32\Tasks` 目录是**空的**（计划任务要等系统首次启动时才生成），
@@ -603,9 +684,10 @@ load 失败只 `Write-Warning` 跳过，不影响构建。
 
 | 触发 | 时机 | 做什么 |
 |---|---|---|
-| `SetupComplete.cmd` 里 `schtasks /Create` + **`schtasks /Run`**（失败才降级 `start /B`） | OOBE 结束、第一次登录**之前** | 先做与登录无关的三件事（关 Defender、卸 OneDrive、删更新/遥测计划任务），然后**原地等待第一次交互式登录**（最多 45 分钟，每 10 秒刷新一次实例锁） |
-| `ONLOGON` 触发器（同一任务） | 第一个用户真正登录时 | 上面那个实例还在等 → 拿不到 15 分钟内的实例锁 → 直接让路；如果 `SetupComplete` 那次 `schtasks /Run` 压根没成功，这次就是兜底 |
+| `Register.cmd` 里 `schtasks /Create` + **`schtasks /Run`**（失败才降级 `start /B`）—— 入口 ①：`specialize` pass；入口 ②：`SetupComplete.cmd` | OOBE 结束、第一次登录**之前** | 先做与登录无关的几件事（关 Defender、关更新服务、卸 OneDrive、删更新/遥测计划任务），然后**原地等待第一次交互式登录**（最多 45 分钟，每 10 秒刷新一次实例锁） |
+| `ONLOGON` 触发器（同一任务） | 第一个用户真正登录时 | 上面那个实例还在等 → 拿不到 15 分钟内的实例锁 → 直接让路；如果两个入口的 `schtasks /Run` 压根没成功，这次就是兜底 |
 | 登录被检测到之后 | `explorer` 起来 + 60 秒宽限 | 删点名要删的 Appx，并**最多再补刀 10 分钟**（每 60 秒重查一次，直到目标包全部消失） |
+| **补刀激活器** | Appx 清理结束、写 `CLEANUP_DONE` **之前** | 若还没有 `ACTIVATION_RESULT.txt` → 等 30 秒再查一次 → 还没有就 `schtasks /Run /TN SYSTEM_Intel_MIC_Activate` 把激活器再拉一遍（幂等：有结果标记直接退出，没拿到授权就留着标记等下次登录） |
 | 结束 | 见下 | 写 `C:\FirstBoot\CLEANUP_DONE` → **`schtasks /Delete` 自我删除任务**；日志 `C:\FirstBoot\cleanup.log` |
 
 > **为什么非要等登录**：`Getstarted` / `WindowsBackup` / `SecHealthUI` 在离线 provisioned
@@ -619,9 +701,11 @@ load 失败只 `Write-Warning` 跳过，不影响构建。
 | # | 动作 | 为什么必须在线 |
 |---|---|---|
 | 1 | `Stop-Service` + `Set-Service -StartupType Disabled`：`SecurityHealthService` `WdNisSvc` `WinDefend` `Sense`；写 `TamperProtection=0`、`DisableAntiSpyware=1`、`DisableAntiVirus=1`、`DisableRealtimeMonitoring=1` | 篡改保护（Tamper Protection）在线会挡住策略写入并把服务拉回来，必须先在运行时关掉。这步**不等登录**，任务一启动就做 |
+| **1b** | 同样 `Stop-Service` + `Set-Service -StartupType Disabled`：`wuauserv` `UsoSvc` `WaaSMedicSvc` `DoSvc` | 离线 hive 已写过 `Start=4`，但 `WaaSMedicSvc` 的职责就是「发现更新服务被关掉就改回来」，还带**服务恢复机制**会自动拉起 —— 在线必须再钉一次。这步同样**不等登录** |
 | 2 | 跑 `OneDriveSetup.exe /uninstall`（System32 + SysWOW64），`Stop-Process` 掉 `OneDrive`/`OneDriveStandaloneUpdater`/`OneDriveSetup`，扫 `HKLM\...\Run` 和 `WOW6432Node\...\Run` 里所有含 `OneDrive` 的值删掉，`takeown` + `icacls` 后 `Remove-Item` 清残留目录（含 `C:\Users\*\AppData\Local\Microsoft OneDrive`） | 离线删 HKLM `Run` 两个键时日志「已删除注册表值」= 0 条（说明**真正的触发点不在 HKLM**），跑起来才能看到并清掉所有残留；OneDrive 是可执行程序（`OneDriveSetup.exe`），不是 Appx，只能跑它的官方卸载器。同样**不等登录** |
-| 3 | `schtasks /Delete /F` ⑧b 那张更新/遥测任务清单（12 个） | 同 ⑧b 的说明：离线 `System32\Tasks` 是空的，只能在线删。同样**不等登录** |
+| 3 | `schtasks /Delete /F` **按文件名**列 ⑧b(b) 那张清单（22 个，含 `UpdateOrchestrator\*` `WaaSMedic\*` 的 Windows 11 真实路径），**再按目录整棵枚举** `Get-ScheduledTask -TaskPath` 把 `WindowsUpdate\` `UpdateOrchestrator\` `WaaSMedic\` 三个目录下所有任务兜底删掉 | 同 ⑧b 的说明：离线 `System32\Tasks` 是空的，只能在线删；按名字列会漏（老布局/新布局路径不一样），所以再加一层**按目录枚举**兜底。同样**不等登录** |
 | 4 | **等第一次交互式登录**（最多 45 分钟）→ `Get-AppxProvisionedPackage -Online` + `Get-AppxPackage -AllUsers` 里删 **`Getstarted`（入门）/ `WindowsBackup`（Windows 备份）/ `SecHealthUI`（Windows 安全中心）/ `OneDriveSync`**，外加 `GetHelp` `MSTeams` `OutlookForWindows` `BingNews` 兜底 → 最多再补刀 10 分钟 | 这四个在离线的 provisioned 列表里 **grep 计数 = 0**（根本没注册成预置包），离线 `/Remove-ProvisionedAppxPackage` 无从下手；`SecHealthUI` 就算能匹配到，离线删也报 `0x80073CFA`（退出码 15610，日志里唯一的 `[fail]`）——它是系统应用，只能系统跑起来后以 SYSTEM 身份在线删，而且**必须等到首登之后** |
+| **6** | 若 `C:\FirstBoot\ACTIVATION_RESULT.txt` 不存在 → 等 30 秒再查 → 仍不存在就 `schtasks /Run /TN SYSTEM_Intel_MIC_Activate` | 激活器的**第三道兜底**（前两道：`Register.cmd` 的 `/run`、`ONLOGON` 触发器）。它跑在 Appx 清理之后，此时激活器若还在装 Office，任务计划程序默认 `MultipleInstances=IgnoreNew` 会**忽略这次重复触发**，不会撞车 |
 
 **实例锁 `C:\FirstBoot\cleanup.lock`**：`SetupComplete` 的 `/Run` 与 `ONLOGON` 触发可能撞车。
 - 拿不到锁且锁文件时间戳在 15 分钟内 → 直接退出，让正在跑的那个做完；
@@ -668,13 +752,18 @@ load 失败只 `Write-Warning` 跳过，不影响构建。
 - **放置**：镜像根的 `\MAS\MAS_AIO.cmd` → 装完就是 `C:\MAS\MAS_AIO.cmd`
 
 **跑在哪：`C:\FirstBoot\Activate.cmd`（由计划任务 `SYSTEM_Intel_MIC_Activate` 以 SYSTEM 身份、
-`/SC ONSTART` 拉起，首启 `schtasks /Run` 立刻跑一次），不是 `FirstBoot.ps1`。**
+`/SC ONLOGON` 拉起 —— 每次登录都触发，直到拿到授权才自我删除），不是 `FirstBoot.ps1`。**
 
 > **为什么改**：上一版是 `FirstBoot.ps1` 里 `cmd /c MAS_AIO.cmd`，三个坑全踩了 ——
 > ① 没带参数 → MAS 弹**交互菜单**，没人按键就一直卡住；
 > ② 跑在**普通用户会话** → 没权限、可能弹 UAC；
 > ③ 没等联网 → 26100+ 的 HWID/TSforge **必须联网**才成功。
 > 现在交给 SYSTEM 后台进程，前台 `FirstBoot.ps1` 只负责**显示结果**。
+>
+> **任务从哪里注册（2026-10-07 补的兜底）**：三个入口，**任一个跑到了任务就存在** ——
+> ① `autounattend.xml` 的 `specialize` pass（Setup 自己必然执行）；
+> ② `SetupComplete.cmd` → `C:\FirstBoot\Register.cmd`；
+> ③ `Cleanup.ps1` 在清理结束前发现没有结果标记时 `schtasks /Run` **补拉一次**。
 
 **执行顺序（`Activate.cmd`）：**
 
@@ -682,8 +771,16 @@ load 失败只 `Write-Warning` 跳过，不影响构建。
 > 见上一节「装机后在线清理」。激活器只负责 Office + 联网 + MAS，两件事并行不打架。
 
 0. 已有 `C:\FirstBoot\ACTIVATION_RESULT.txt` → 直接 `schtasks /Delete` 自删任务并退出（幂等）
-1. **装 Office**：先看 `WINWORD.EXE` 在不在 → 不在且 `setup.exe` 空闲就拉起（最多试 5 次），
-   每 15 秒一轮、上限 90 分钟；**不依赖任何别的进程写标记，重启后自动续装**
+1. **装 Office（同步调用，这是「Office 压根没装」的修复点）**：
+   - 先看 `WINWORD.EXE` 装没装；没装且 `setup.exe` 没在跑 → **同步**执行
+     `powershell -Command "Start-Process setup.exe /configure ... ; WaitForExit(1200)"`，
+     **每次最多 20 分钟，最多试 3 次**；
+   - 每次返回后再**轮询 `WINWORD.EXE` 最多 6 分钟**，免得 `setup.exe` 提前返回就白白烧掉重试次数；
+   - ⚠ **原来是 `start "" /MIN setup.exe /configure ...`**：任务是 `/RU SYSTEM` 跑在
+     **非交互 session 0 的窗口站**里，`start` 那一下常常**静默失败**（既没窗口也起不来），
+     重试 5 次后直接写 `OFFICE=SKIP` —— 这就是实机「Office 压根没装」的根因。
+     改成同步调用（SCCM / Intune 部署 Office C2R 就是这么跑的）+ `WaitForExit(1200)`
+     硬卡上限，`setup.exe` 挂了也拖不死后面的激活流程
 2. **等联网**（`ping 223.5.5.5` / `114.114.114.114`），上限 30 分钟
 3. 分两次调用 MAS（**分开跑，免得只有一个方法被执行**）：
    - 联网时：`call MAS_AIO.cmd /HWID /S` → Windows 数字许可证永久激活
@@ -693,9 +790,19 @@ load 失败只 `Write-Warning` 跳过，不影响构建。
 4. 用 WMI 复核**真实授权状态**：`Get-CimInstance SoftwareLicensingProduct -Filter
    'PartialProductKey IS NOT NULL AND LicenseStatus = 1'`（不出任何弹窗）
 5. `OFFICE=OK` 才删 `C:\OfficeInstall`
-6. 结果写 `C:\FirstBoot\ACTIVATION_RESULT.txt`（`NETWORK=` `OFFICE=` `HWID_EXIT=` `OHOOK_EXIT=`
+6. **重试策略（新）**：只有 `WIN_LICENSE=1` 才写结果标记；
+   否则**故意不写** `ACTIVATION_RESULT.txt`，`C:\FirstBoot\ACT_TRY` 里记一次数 ——
+   `ONLOGON` 触发器会在**下次登录**自动再来一遍（典型场景：首登时还没连 Wi-Fi，
+   30 分钟等联网超时就放弃了，连上网络之后的下一次登录能补上）。**最多 5 次**，
+   第 5 次仍失败才写标记 + `schtasks /Delete` 自删任务，避免任务永远赖着不删
+7. 结果写 `C:\FirstBoot\ACTIVATION_RESULT.txt`（`NETWORK=` `OFFICE=` `HWID_EXIT=` `OHOOK_EXIT=`
    `WIN_LICENSE=` `DONE`）+ `OFFICE_DONE`，完整输出留在 `C:\FirstBoot\activation.log`，
    最后 `schtasks /Delete /TN SYSTEM_Intel_MIC_Activate` **自我删除**
+
+> **⚠ 结果文件里的 `>>` 全部写在行首**（`>> "%RES%" echo HWID_EXIT=!HWIDCODE!`）：
+> 如果写成 `echo HWID_EXIT=1>> "%RES%"`，cmd 会把紧贴着 `>` 的 `1` 认成**文件句柄重定向**
+> （`1>` = stdout），结果就是值被静默丢掉、文件里只剩 `HWID_EXIT=` ——
+> 前台只能读到空值，明明激活成功也显示失败。行首 `>>` 彻底消除这个歧义。
 
 **前台显示**：`FirstBoot.ps1` 轮询结果文件（上限 60 分钟），然后按「真实授权状态优先、
 退出码兜底」给出 ✅/⚠，并附日志尾部；失败时提示手动双击 `C:\MAS\MAS_AIO.cmd` 重试。
@@ -703,43 +810,52 @@ load 失败只 `Write-Warning` 跳过，不影响构建。
 - **风险提示**：`MAS_AIO.cmd` 是第三方脚本，Defender 可能报「hacktool」，属于误报性质，
   介意就关掉 `mas_activate` 开关（关掉后 `FirstBoot.ps1` 只会显示未等到结果的提示）
 
-## 首登录编排器（`SetupComplete.cmd` + 计划任务 + `FirstBoot.ps1`）
+## 首登录编排器（`Register.cmd` + `SetupComplete.cmd` + 计划任务 + `FirstBoot.ps1`）
 
-**触发链（单一属主 + 重启可续跑）：**
+**触发链（两个入口 + 三道兜底，任何一环掉了都还能跑起来）：**
 
 ```
-SetupComplete.cmd（SYSTEM，OOBE 结束后）
+【入口①】autounattend.xml 的 specialize pass（Windows Setup 自己必然执行，SYSTEM）
+  └─ cmd /c "C:\FirstBoot\Register.cmd & exit 0"
+        ← 只注册，不 /Run：这段跑在装机中段，网络/用户都还没就绪
+
+【入口②】SetupComplete.cmd（SYSTEM，OOBE 结束后、首登之前）
+  └─ call "C:\FirstBoot\Register.cmd" /run
+        ← 注册完立刻 /Run 两个任务抢跑；Register.cmd 缺失时退回原来的内联写法
+
+C:\FirstBoot\Register.cmd（幂等，两个入口调的是同一个文件）
   ├─ schtasks /Create SYSTEM_Intel_MIC_Cleanup  /SC ONLOGON /RU SYSTEM /RL HIGHEST /F
-  │    └─ schtasks /Run  … → 立刻开跑（先做关 Defender / 卸 OneDrive / 删计划任务，
-  │                           然后在后台等第一次交互式登录，登录后再删 入门/备份/安全中心）
-  │                           /Run 失败才降级成 start /B
-  ├─ schtasks /Create SYSTEM_Intel_MIC_Activate /SC ONSTART /RU SYSTEM /RL HIGHEST /F
-  │    └─ schtasks /Run  … → 立刻跑一次（创建失败才降级成 start /B）
-  └─ reg add HKLM\...\RunOnce\SYSTEM_Intel_MIC_FirstBoot   → 首次登录拉起 FirstBoot.ps1
+  ├─ schtasks /Create SYSTEM_Intel_MIC_Activate /SC ONLOGON /RU SYSTEM /RL HIGHEST /F
+  ├─ reg add HKLM\...\RunOnce\SYSTEM_Intel_MIC_FirstBoot   → 首登拉起 FirstBoot.ps1
+  └─ 带 /run 时：两个任务各 /Run 一次，/Run 失败才降级成 start /B
 
 SYSTEM_Intel_MIC_Cleanup 计划任务（SYSTEM，ONLOGON；写完 CLEANUP_DONE 自我删除）
   └─ C:\FirstBoot\Cleanup.ps1
        ├─ 0) 有 CLEANUP_DONE → 直接退出
        ├─ 1) 抢实例锁（拿不到且锁 <15 分钟 → 让路退出）
        ├─ 2) 关 Defender 四个服务 + 篡改保护/策略键（不等登录）
+       ├─ 1b) 关更新四个服务 wuauserv/UsoSvc/WaaSMedicSvc/DoSvc（不等登录）
        ├─ 3) OneDriveSetup /uninstall + 清 HKLM Run + 删残留目录（不等登录）
-       ├─ 4) schtasks /Delete 更新·遥测计划任务 12 个（不等登录）
+       ├─ 4) schtasks /Delete 更新·遥测计划任务 22 个 + 按目录整棵枚举兜底（不等登录）
        ├─ 5) 等第一次交互式登录（最多 45 分钟，每 10 秒刷新锁）
        │      判据 = 真实用户配置文件 + explorer.exe 已启动
        ├─ 6) 宽限 60 秒 → 删 Getstarted/WindowsBackup/SecHealthUI/… → 最多补刀 10 分钟
-       └─ 7) 确认见过登录才写 CLEANUP_DONE + schtasks /Delete 自删任务
+       ├─ 7) 激活器还没有 ACTIVATION_RESULT.txt → schtasks /Run 再拉它一次（第三道兜底）
+       └─ 8) 确认见过登录才写 CLEANUP_DONE + schtasks /Delete 自删任务
               没见过登录 → 不写标记、任务留着，下次登录的 ONLOGON 触发会再来一遍
 
-SYSTEM_Intel_MIC_Activate 计划任务（SYSTEM，ONSTART；跑完自我删除）
+SYSTEM_Intel_MIC_Activate 计划任务（SYSTEM，ONLOGON；拿到授权才自我删除）
   └─ C:\FirstBoot\Activate.cmd
        ├─ 0) 已有 ACTIVATION_RESULT.txt → 直接 schtasks /Delete 自删，退出
-       ├─ 1) Office：先看 WINWORD.EXE 装没装 → 没装且 setup.exe 空闲就拉起
-       │      （最多试 5 次 / 等 90 分钟；**重启后会自动接着装**）
+       ├─ 1) Office：没装就**同步**跑 setup.exe /configure（每次上限 20 分钟，最多 3 次）
+       │      → 返回后再轮询 WINWORD.EXE 最多 6 分钟；不依赖别人写标记，重启/次登自动续装
        ├─ 2) 等联网（ping 223.5.5.5 / 114.114.114.114，上限 30 分钟）
        ├─ 3) MAS：联网才跑 /HWID（Windows），/Ohook 常跑（Office）
        ├─ 4) 调 SoftwareLicensingProduct 拿真实 WIN_LICENSE（0/1）
        ├─ 5) Office 装成了才 rmdir /s /q C:\OfficeInstall（约 3.6 GB）
-       └─ 6) 写 ACTIVATION_RESULT.txt（NETWORK / OFFICE / HWID_EXIT / OHOOK_EXIT / WIN_LICENSE / DONE）
+       ├─ 6) WIN_LICENSE≠1 → **不写结果标记**，ACT_TRY 计数 +1，任务留着等下次登录
+       │      （最多 5 次，第 5 次才写标记并自删）
+       └─ 7) 写 ACTIVATION_RESULT.txt（NETWORK / OFFICE / HWID_EXIT / OHOOK_EXIT / WIN_LICENSE / DONE）
             + OFFICE_DONE → schtasks /Delete 自删任务
 
 FirstBoot.ps1（用户会话，RunOnce 触发）
@@ -749,11 +865,22 @@ FirstBoot.ps1（用户会话，RunOnce 触发）
   └─ 显示 ✅/⚠ 激活结果（附 activation.log 尾部）→ 30 秒后自动关窗；用户也可随时点 X 关掉
 ```
 
+> **为什么多了 `specialize` 这个入口（2026-10-07）**：实机反馈「Office 压根没装、
+> Win 和 Office 都没激活、四个点名 Appx 也没删」三件事**同时**发生 ——
+> 它们唯一的共同前置条件就是「那条 `SetupComplete → schtasks /Create` 的链子跑到了」。
+> 以前这条链是**单点**：一旦 `SetupComplete.cmd` 没执行（用 DISM++/NTLite 部署、
+> 脚本被安全软件拦掉、装完后被清理），三个任务**一个都不会注册**，装完系统就什么都不发生。
+> 现在 `specialize` 是 Setup 自己必然执行的一段，先幂等注册一遍，`SetupComplete` 再来一遍，
+> 最后还有 `Cleanup.ps1` 补拉激活器 —— 三道兜底。
+>
 > **为什么改用计划任务（原来是 `start /B`）**：`start /B` 起的 `Activate.cmd` 是
 > `SetupComplete.cmd` 的子进程，用户只要在激活完成前**重启一次**，进程就被杀掉，
 > 而 `RunOnce` 值也已经消费掉了 —— 结果就是实机反馈的「装完系统 Win 和 Office 都没激活」。
-> `schtasks /SC ONSTART /RU SYSTEM` 之后：首启手动 `/Run` 一次、中途重启下次开机自己再跑、
-> Office 没装完会重新拉起 `setup.exe` 续装、全部成功后写结果标记并**自我删除**，不留常驻。
+> `schtasks /SC ONLOGON /RU SYSTEM` 之后：首登前手动 `/Run` 一次、中途重启下次登录自己再跑、
+> Office 没装完会重新同步拉起 `setup.exe` 续装、拿到授权后写结果标记并**自我删除**，不留常驻。
+> **为什么从 `ONSTART` 改成 `ONLOGON`**：`ONSTART` 在每次开机、用户还没登录时就触发，
+> 那时网络十有八九还没连上（Wi-Fi 要进桌面才连），30 分钟等联网白白耗掉一次机会；
+> `ONLOGON` 触发时机是「有人真的登录了」，网络/用户环境都已就绪，且失败时下次登录自动重试。
 >
 > **为什么 `FirstBoot.ps1` 要重写（原来是「弹个窗口就死机，只能重启」）**：上一版在
 > `$win.Show()` 之后**在同一个 UI 线程上** `while + Start-Sleep` —— WPF 的消息泵根本没转，
@@ -854,10 +981,12 @@ Release 描述里会带：构建号、通道、镜像内版本列表、大小、
 | 装到「此电脑不符合 Windows 11 要求」被拦 | `LabConfig` 在 28020 上未实测；关掉 `hw_bypass` 重跑（`unattend` 保持开） |
 | 官方安装程序报「Windows 安装遇到错误。错误代码: `0x80070002 - 0x40030`」 | `windowsPE` 阶段某条 `RunSynchronous` 失败（`0x80070002` = 找不到文件，`0x40030` = 应答文件 `RunSynchronous` 应用失败）。历史根因是 `sc config wuauserv`（WinPE 里没有 `sc.exe`），已修：删掉该命令 + 每条命令都套 `cmd /c "… & exit 0"`。若仍复现，关掉 `hw_bypass` 只留基础应答文件重跑 |
 | 开机进桌面弹出进度窗口后**卡死**，只能重启 | 上一版 `FirstBoot.ps1` 在 UI 线程上 `Start-Sleep` 阻塞了 WPF 消息泵，已改成「后台 runspace + `ShowDialog` + `DispatcherTimer`」。装新 ISO 即可；旧镜像上可以任务管理器结束 `powershell` 进程，不影响激活 |
-| 装完系统 **Win 和 Office 都没激活** | 激活器原来是 `SetupComplete` 的子进程，重启一次就被杀。现在改用计划任务 `SYSTEM_Intel_MIC_Activate`（`ONSTART` / SYSTEM，跑完自删）。装新 ISO；旧镜像可手动以管理员运行 `C:\FirstBoot\Activate.cmd`，或双击 `C:\MAS\MAS_AIO.cmd` |
+| 装完系统 **Win 和 Office 都没激活** | 激活器原来是 `SetupComplete` 的子进程，重启一次就被杀。现在改用计划任务 `SYSTEM_Intel_MIC_Activate`（`ONLOGON` / SYSTEM，**拿到授权才自删**）。装新 ISO；旧镜像可手动以管理员运行 `C:\FirstBoot\Activate.cmd`，或双击 `C:\MAS\MAS_AIO.cmd` |
+| 装完系统 **Office 没装、激活没成、四个点名 Appx 也没删**（三件同时发生） | 三件事唯一的共同前置是「`SetupComplete.cmd → schtasks /Create` 那条链跑到了」。旧版只有这一个入口，链子一断就全断。现在 `autounattend.xml` 的 **`specialize` pass 会先幂等注册一遍**，`SetupComplete` 再来一遍，`Cleanup.ps1` 还会补拉激活器 —— 三道兜底。装新 ISO；旧镜像用管理员跑 `C:\FirstBoot\Register.cmd /run` |
+| OOBE 还在「正在检查更新」 | 更新四服务（`wuauserv`/`UsoSvc`/`WaaSMedicSvc`/`DoSvc`）+ 硬策略 + 删 `usoclient.exe` 三条一起下手，见「Windows 更新」一节。装新 ISO 后若仍出现，说明用的是旧镜像 |
+| 进度窗口显示 ⚠ 激活未完成 | 看 `C:\FirstBoot\activation.log`（`HWID_EXIT` / `OHOOK_EXIT` / `WIN_LICENSE`）。**新版在没拿到授权时故意不写结果标记**，`ONLOGON` 任务会在**下次登录**自动重试（最多 5 次，计数在 `C:\FirstBoot\ACT_TRY`）；连上网再登录一次即可。也可以联网后手动跑 `C:\FirstBoot\Activate.cmd`，或双击 `C:\MAS\MAS_AIO.cmd` 手动选方法 |
+| 首次开机后 Office 没装上 | Office 是**静默安装**（`Display Level="None"`，SYSTEM 后台跑，不会弹窗）。旧版用 `start /MIN` 在 session 0 里会**静默失败**，已改成同步调用。看 `C:\FirstBoot\activation.log` 里的 `Office setup attempt N` / `Office installed` / `Office install failed after 3 attempts`，以及 `C:\FirstBoot\OFFICE_DONE`；装失败会保留 `C:\OfficeInstall`（唯一离线安装源），可手动 `setup.exe /configure configuration.xml` |
 | 「入门」「Windows 备份」「OneDrive」「Windows 安全中心」还在 | 离线镜像里这几个根本没注册成预置包（是**随首登才注册的 staged 包**），必须登录之后才删得掉。先看 `C:\FirstBoot\cleanup.log`：带 `no logon seen` 就说明它还没等到登录 → 注销再登录一次会由 `ONLOGON` 触发器重跑。若任务已自删但没删干净，先删 `C:\FirstBoot\CLEANUP_DONE`，再用管理员 PowerShell 跑 `powershell -NoProfile -ExecutionPolicy Bypass -File C:\FirstBoot\Cleanup.ps1` |
-| 进度窗口显示 ⚠ 激活未完成 | 看 `C:\FirstBoot\activation.log`（`HWID_EXIT` / `OHOOK_EXIT` / `WIN_LICENSE`）。联网后重跑 `C:\FirstBoot\Activate.cmd`，或双击 `C:\MAS\MAS_AIO.cmd` 手动选方法 |
-| 首次开机后 Office 没装上 | Office 是**静默安装**（`Display Level="None"`，SYSTEM 后台跑，不会弹窗）。看 `C:\FirstBoot\activation.log` 里的 `starting Office setup` / `Office installed`，以及 `C:\FirstBoot\OFFICE_DONE`；装失败会保留 `C:\OfficeInstall`（唯一离线安装源），可手动 `setup.exe /configure configuration.xml` |
 | 想知道某个包/服务/功能为什么还在 | 日志里搜 `[keep]`（Appx 保留判定）、`[feature]`（可选功能全表）、`[size:清理前]`（体积分布） |
 | `找不到 PROFESSIONAL` / 语言包 | 该构建暂未提供 zh-cn 或对应版本，换个构建号 |
 | 分卷上传失败 | 确认 workflow 有 `permissions: contents: write`（已内置），token 未过期 |
