@@ -737,8 +737,11 @@ load 失败只 `Write-Warning` 跳过，不影响构建。
 - **集成方式**：把 `setup.exe` + `configuration.xml` + `Office\Data\<版本>` 拷进镜像根的
   `C:\OfficeInstall`，实测约 **3174 MB**
 - **安装时机**：`C:\FirstBoot\Activate.cmd`（计划任务 `SYSTEM_Intel_MIC_Activate`，SYSTEM 权限，
-  首启 + 每次开机）按「先看 `WINWORD.EXE` 装没装 → 没装且 `setup.exe` 空闲就拉起」的节奏启动
-  `setup.exe /configure`，上限 90 分钟；**重启后会自动接着装**
+  **`ONLOGON`** = 首登前 `/Run` 抢跑 + 每次登录都会触发直到成功）按
+  「先看 `WINWORD.EXE` 装没装 → 没装且 `setup.exe` 空闲就**同步**跑」的节奏装：
+  **每次上限 20 分钟、最多 3 次**，每次返回后再轮询 `WINWORD.EXE` 最多 6 分钟；
+  **中途重启/关机，下次登录自动接着装**（旧版 `start /MIN` 在 session 0 里静默失败，就是它导致
+  实机「Office 压根没装」）
 - **装完自动清理**：`Activate.cmd` 确认 `C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE`
   存在（`OFFICE=OK`）→ 等 20 秒让 Click-To-Run 放掉文件句柄 → `rmdir /s /q C:\OfficeInstall`
   （释放约 3.6 GB），成败都写进 `activation.log`；
@@ -804,8 +807,15 @@ load 失败只 `Write-Warning` 跳过，不影响构建。
 > （`1>` = stdout），结果就是值被静默丢掉、文件里只剩 `HWID_EXIT=` ——
 > 前台只能读到空值，明明激活成功也显示失败。行首 `>>` 彻底消除这个歧义。
 
-**前台显示**：`FirstBoot.ps1` 轮询结果文件（上限 60 分钟），然后按「真实授权状态优先、
-退出码兜底」给出 ✅/⚠，并附日志尾部；失败时提示手动双击 `C:\MAS\MAS_AIO.cmd` 重试。
+**前台显示**：`FirstBoot.ps1` 先等 `OFFICE_DONE`（上限 45 分钟）→ 再等结果文件（上限 45 分钟），
+然后按「真实授权状态优先、退出码兜底」给出 ✅/⚠，并附日志尾部；失败时提示手动双击
+`C:\MAS\MAS_AIO.cmd` 重试。
+
+> **早退分支（2026-10-07 新增）**：新版重试策略下，拿不到授权时 `Activate.cmd` **不写**结果文件，
+> 只写 `C:\FirstBoot\ACT_TRY` 计数。所以只要看见 `ACT_TRY`，就说明这一轮已经结束，进度窗
+> **立刻收窗**并显示「下次登录会自动重试」——否则窗口会干等满 45 分钟，看着就像「首启卡死」。
+> 另外，`OFFICE_DONE` 都没等到（= 计划任务压根没跑）时会**跳过**第二段等待，直接出结论，
+> 所以最坏情况总时长是 45 分钟而不是 45+45 分钟。
 
 - **风险提示**：`MAS_AIO.cmd` 是第三方脚本，Defender 可能报「hacktool」，属于误报性质，
   介意就关掉 `mas_activate` 开关（关掉后 `FirstBoot.ps1` 只会显示未等到结果的提示）
@@ -860,7 +870,8 @@ SYSTEM_Intel_MIC_Activate 计划任务（SYSTEM，ONLOGON；拿到授权才自�
 
 FirstBoot.ps1（用户会话，RunOnce 触发）
   ├─ 自删 RunOnce（HKLM + HKCU 兜底，explorer 本来也会删）
-  ├─ 后台 runspace 等 OFFICE_DONE（上限 90 分钟）→ 等 ACTIVATION_RESULT.txt（上限 60 分钟）
+  ├─ 后台 runspace 等 OFFICE_DONE（上限 45 分钟）→ 等 ACTIVATION_RESULT.txt（上限 45 分钟，
+  │      看见 ACT_TRY 就说明本轮尝试已结束 → 立刻收窗，不干等；OFFICE_DONE 没等到则直接出结论）
   ├─ UI 线程 ShowDialog + DispatcherTimer（500 ms 一次）把共享状态刷到窗口
   └─ 显示 ✅/⚠ 激活结果（附 activation.log 尾部）→ 30 秒后自动关窗；用户也可随时点 X 关掉
 ```
